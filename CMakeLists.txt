@@ -28,10 +28,10 @@ ENDIF()
 
 # List configuration options
 OPTION(OpenMVS_BUILD_TOOLS "Build example applications" ON)
-OPTION(OpenMVS_BUILD_VIEWER "Build viewer application" ON)
+OPTION(OpenMVS_BUILD_VIEWER "Build viewer application" OFF)
 OPTION(OpenMVS_USE_OPENMP "Enable OpenMP library" ON)
 OPTION(OpenMVS_USE_BREAKPAD "Enable BreakPad library" ON)
-OPTION(OpenMVS_USE_PYTHON "Enable Python library bindings" ON)
+OPTION(OpenMVS_USE_PYTHON "Enable Python library bindings" OFF)
 OPTION(OpenMVS_USE_CERES "Enable CERES optimization library" OFF)
 OPTION(OpenMVS_USE_CUDA "Enable CUDA library" ON)
 OPTION(OpenMVS_USE_FAST_FLOAT2INT "Use an optimized code to convert real numbers to int" OFF)
@@ -40,7 +40,7 @@ OPTION(OpenMVS_USE_FAST_CBRT "Use an optimized code to compute the cubic root" O
 OPTION(OpenMVS_USE_SSE "Enable SSE optimizations" ON)
 OPTION(OpenMVS_MAX_CUDA_COMPATIBILITY "Build for maximum CUDA device compatibility" OFF)
 OPTION(OpenMVS_ENABLE_IPO "Whether to enable interprocedural optimization" ON)
-OPTION(OpenMVS_ENABLE_TESTS "Enable test code" ON)
+OPTION(OpenMVS_ENABLE_TESTS "Enable test code" OFF)
 
 # Disable CUDA on MacOS
 IF(APPLE)
@@ -64,6 +64,21 @@ ENDIF()
 IF(OpenMVS_USE_PYTHON)
 	LIST(APPEND VCPKG_MANIFEST_FEATURES "python")
 	SET(PARTIAL_BUILD_SHARED_LIBS ON)
+ENDIF()
+
+# ------------------------------------------------------------------------------
+# Dependency configuration
+# ------------------------------------------------------------------------------
+# Load automatically VCPKG toolchain if available
+IF(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+  IF(DEFINED ENV{VCPKG_ROOT})
+      SET(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
+      IF(NOT DEFINED VCPKG_TARGET_TRIPLET AND DEFINED ENV{VCPKG_DEFAULT_TRIPLET})
+          SET(VCPKG_TARGET_TRIPLET "$ENV{VCPKG_DEFAULT_TRIPLET}" CACHE STRING "")
+      ENDIF()
+  ELSE()
+      SET(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg-exports/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
+  ENDIF()
 ENDIF()
 
 # Name of the project:

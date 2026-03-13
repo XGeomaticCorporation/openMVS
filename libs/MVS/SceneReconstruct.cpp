@@ -38,8 +38,8 @@
 #include <CGAL/Triangulation_cell_base_with_info_3.h>
 #include <CGAL/Spatial_sort_traits_adapter_3.h>
 #include <CGAL/AABB_tree.h>
-#include <CGAL/AABB_traits_3.h>
-#include <CGAL/AABB_triangle_primitive_3.h>
+// #include <CGAL/AABB_traits_3.h>
+// #include <CGAL/AABB_triangle_primitive_3.h>
 #include <CGAL/Polyhedron_3.h>
 
 using namespace MVS;
@@ -57,7 +57,7 @@ using namespace MVS;
 
 // uncomment to use IBFS algorithm for max-flow
 // (faster, but not clear license policy)
-#define DELAUNAY_MAXFLOW_IBFS
+// #define DELAUNAY_MAXFLOW_IBFS
 
 #pragma push_macro("VERBOSE")
 #undef VERBOSE

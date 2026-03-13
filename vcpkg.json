@@ -3,6 +3,7 @@
   "version": "2.4.0",
   "description": "OpenMVS: open Multi-View Stereo reconstruction library",
   "homepage": "https://cdcseacave.github.io/openMVS",
+  "builtin-baseline": "ee2d2a100103e0f3613c60655dcf15be7d5157b8",
   "dependencies": [
     "boost-math",
     "boost-iostreams",
@@ -21,7 +22,6 @@
       "name": "opencv",
       "features": [
         "eigen",
-        "jpegxl",
         "openexr"
       ]
     },

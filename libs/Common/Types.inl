@@ -3106,10 +3106,10 @@ static bool SaveImage(const cv::Mat& img, const String& fileName)
 		compression_params.push_back(cv::IMWRITE_JPEG_QUALITY);
 		compression_params.push_back(95);
 	} else
-	if (ext == ".jxl") {
-		compression_params.push_back(cv::IMWRITE_JPEGXL_QUALITY);
-		compression_params.push_back(95);
-	} else
+	// if (ext == ".jxl") {
+	// 	compression_params.push_back(cv::IMWRITE_JPEGXL_QUALITY);
+	// 	compression_params.push_back(95);
+	// } else
 	if (ext == ".pfm") {
 		if (img.depth() != CV_32F)
 			return false;
