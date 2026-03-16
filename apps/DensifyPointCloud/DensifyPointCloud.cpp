@@ -145,6 +145,12 @@ bool Application::Initialize(size_t argc, LPCTSTR* argv)
 	float fDepthDiffThreshold;
 	float fDepthReprojectionErrorThreshold;
 	bool bRemoveDmaps;
+	
+	// add
+	unsigned nMinPixelsFuse;
+	float fNCCThresholdKeep;
+	float fMaxAngle;
+
 	boost::program_options::options_description config("Densify options");
 	config.add_options()
 		("input-file,i", boost::program_options::value<std::string>(&OPT::strInputFileName), "input filename containing camera poses and image list")
@@ -158,7 +164,10 @@ bool Application::Initialize(size_t argc, LPCTSTR* argv)
 		("min-resolution", boost::program_options::value(&nMinResolution)->default_value(640), "do not scale images lower than this resolution")
 		("sub-resolution-levels", boost::program_options::value(&nSubResolutionLevels)->default_value(2), "number of patch-match sub-resolution iterations (0 - disabled)")
 		("number-views", boost::program_options::value(&nNumViews)->default_value(nNumViewsDefault), "number of views used for depth-map estimation (0 - all neighbor views available)")
-		("number-views-fuse", boost::program_options::value(&nMinViewsFuse)->default_value(2), "minimum number of images that agrees with an estimate during fusion in order to consider it inlier (<2 - only merge depth-maps)")
+		("min-views-fuse", boost::program_options::value(&nMinViewsFuse)->default_value(2), "minimum number of images that agrees with an estimate during fusion in order to consider it inlier (<2 - only merge depth-maps)")
+		("min-pixel-fuse", boost::program_options::value(&nMinPixelsFuse)->default_value(5), "minimum number of depth-estimates that agree during fusion in order to consider it (multiple pixels can be from the same depth-map)")
+		("ncc-threshold-keep", boost::program_options::value(&fNCCThresholdKeep)->default_value(0.9f), "Maximum 1-NCC score accepted for a match 0.9 0.5")
+		("max-angle", boost::program_options::value(&fMaxAngle)->default_value(65.0f), "Max angle for accepting the depth triangulation 65.0")
 		("ignore-mask-label", boost::program_options::value(&nIgnoreMaskLabel)->default_value(-1), "label value to ignore in the image mask, stored in the MVS scene or next to each image with '.mask.png' extension (<0 - disabled)")
 		("iters", boost::program_options::value(&nEstimationIters)->default_value(numIters), "number of patch-match iterations")
 		("geometric-iters", boost::program_options::value(&nEstimationGeometricIters)->default_value(2), "number of geometric consistent patch-match iterations (0 - disabled)")
@@ -278,6 +287,11 @@ bool Application::Initialize(size_t argc, LPCTSTR* argv)
 	OPTDENSE::fDepthDiffThreshold = fDepthDiffThreshold;
 	OPTDENSE::fDepthReprojectionErrorThreshold = fDepthReprojectionErrorThreshold;
 	OPTDENSE::bRemoveDmaps = bRemoveDmaps;
+	//add
+	OPTDENSE::nMinPixelsFuse = nMinPixelsFuse;
+	OPTDENSE::fMaxAngle = fMaxAngle;
+	OPTDENSE::fNCCThresholdKeep = fNCCThresholdKeep;
+
 	if (!bValidConfig && !OPT::strDenseConfigFileName.empty())
 		OPTDENSE::oConfig.Save(OPT::strDenseConfigFileName);
 
@@ -531,14 +545,15 @@ int main(int argc, LPCTSTR* argv)
 
 	// save the final point-cloud
 	const String baseFileName(MAKE_PATH_SAFE(Util::getFileFullName(OPT::strOutputFileName)));
-	scene.pointcloud.Save(baseFileName+_T(".ply"), (ARCHIVE_TYPE)OPT::nArchiveType == ARCHIVE_MVS);
+	if (ABS(OPT::nFusionMode) != 1)
+		scene.pointcloud.Save(baseFileName + _T(".ply"), true, true);
 	#if TD_VERBOSE != TD_VERBOSE_OFF
 	if (VERBOSITY_LEVEL > 2)
 		scene.ExportCamerasMLP(baseFileName+_T(".mlp"), baseFileName+_T(".ply"));
 	#endif
 	if ((ARCHIVE_TYPE)OPT::nArchiveType == ARCHIVE_MVS)
 		scene.pointcloud.Swap(sparsePointCloud);
-	scene.Save(baseFileName+_T(".mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
+	// scene.Save(baseFileName+_T(".mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
 	#if TD_VERBOSE != TD_VERBOSE_OFF
 	if ((ARCHIVE_TYPE)OPT::nArchiveType == ARCHIVE_MVS)
 		scene.pointcloud.Swap(sparsePointCloud);

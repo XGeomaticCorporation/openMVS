@@ -796,7 +796,7 @@ bool ImportScene(const String& strFolder, const String& strOutFolder, Interface&
 			EnsureRotationMatrix((Matrix3x3d&)pose.R);
 			Eigen::Map<EVec3d>(&pose.C.x) = -(imageColmap.q.inverse() * imageColmap.t);
 			Interface::Image image;
-			image.name = MAKE_PATH_REL(strOutFolder,OPT::strImageFolder+imageColmap.name);
+			image.name = OPT::strImageFolder + imageColmap.name;
 			image.platformID = mapCameras.at(imageColmap.idCamera);
 			image.cameraID = 0;
 			image.ID = imageColmap.ID;

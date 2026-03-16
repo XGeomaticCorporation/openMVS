@@ -372,14 +372,14 @@ namespace BasicPLY {
 				ply.describe_property(elem_names[0], 3, props+6);
 			if (bViews)
 				ply.describe_property(elem_names[0], props[9]);
-			if (bWeights)
-				ply.describe_property(elem_names[0], props[10]);
-			if (bLabel)
-				ply.describe_property(elem_names[0], props[11]);
-			if (bConfidence)
-				ply.describe_property(elem_names[0], props[12]);
-			if (bScale)
-				ply.describe_property(elem_names[0], props[13]);
+			// if (bWeights)
+			// 	ply.describe_property(elem_names[0], props[10]);
+			// if (bLabel)
+			// 	ply.describe_property(elem_names[0], props[11]);
+			// if (bConfidence)
+			// 	ply.describe_property(elem_names[0], props[12]);
+			// if (bScale)
+			// 	ply.describe_property(elem_names[0], props[13]);
 			if (elem_count)
 				ply.element_count(elem_names[0], elem_count);
 		}
@@ -395,15 +395,16 @@ namespace BasicPLY {
 		{"nx",            PLY::Float32, PLY::Float32, offsetof(Vertex,n.x), 0, 0, 0, 0},
 		{"ny",            PLY::Float32, PLY::Float32, offsetof(Vertex,n.y), 0, 0, 0, 0},
 		{"nz",            PLY::Float32, PLY::Float32, offsetof(Vertex,n.z), 0, 0, 0, 0},
-		{"view_indices",  PLY::Uint32,  PLY::Uint32,  offsetof(Vertex,views.pIndices), 1, PLY::Uint8, PLY::Uint8, offsetof(Vertex,views.num)},
-		{"view_weights",  PLY::Float32, PLY::Float32, offsetof(Vertex,views.pWeights), 1, PLY::Uint8, PLY::Uint8, offsetof(Vertex,views.num)},
-		{"label",         PLY::Uint8,   PLY::Uint8,   offsetof(Vertex,label), 0, 0, 0, 0},
-		{"confidence",    PLY::Float32, PLY::Float32, offsetof(Vertex,confidence), 0, 0, 0, 0},
-		{"value",         PLY::Float32, PLY::Float32, offsetof(Vertex,scale), 0, 0, 0, 0},
-		// duplicates
-		{"diffuse_red",   PLY::Uint8,   PLY::Uint8,   offsetof(Vertex,c.r), 0, 0, 0, 0},
-		{"diffuse_green", PLY::Uint8,   PLY::Uint8,   offsetof(Vertex,c.g), 0, 0, 0, 0},
-		{"diffuse_blue",  PLY::Uint8,   PLY::Uint8,   offsetof(Vertex,c.b), 0, 0, 0, 0}
+		{"views",		  PLY::Uint8,   PLY::Uint8,  offsetof(Vertex,views.num), 0, 0, 0, 0}
+		// {"view_indices",  PLY::Uint32,  PLY::Uint32,  offsetof(Vertex,views.pIndices), 1, PLY::Uint8, PLY::Uint8, offsetof(Vertex,views.num)},
+		// {"view_weights",  PLY::Float32, PLY::Float32, offsetof(Vertex,views.pWeights), 1, PLY::Uint8, PLY::Uint8, offsetof(Vertex,views.num)},
+		// {"label",         PLY::Uint8,   PLY::Uint8,   offsetof(Vertex,label), 0, 0, 0, 0},
+		// {"confidence",    PLY::Float32, PLY::Float32, offsetof(Vertex,confidence), 0, 0, 0, 0},
+		// {"value",         PLY::Float32, PLY::Float32, offsetof(Vertex,scale), 0, 0, 0, 0},
+		// // duplicates
+		// {"diffuse_red",   PLY::Uint8,   PLY::Uint8,   offsetof(Vertex,c.r), 0, 0, 0, 0},
+		// {"diffuse_green", PLY::Uint8,   PLY::Uint8,   offsetof(Vertex,c.g), 0, 0, 0, 0},
+		// {"diffuse_blue",  PLY::Uint8,   PLY::Uint8,   offsetof(Vertex,c.b), 0, 0, 0, 0}
 	};
 } // namespace BasicPLY
 } // namespace PointCloudInternal
@@ -645,7 +646,7 @@ bool PointCloud::SavePLY(const String& fileName, bool bViews, bool bLegacyTypes,
 
 	// write the header
 	BasicPLY::Vertex::InitSaveProps(ply, (int)points.size(), !colors.empty(), !normals.empty(),
-		bViews && !pointViews.empty(), bViews && !pointWeights.empty(), bViews && !labels.empty());
+		bViews && !pointViews.empty(), false/*bViews && !pointWeights.empty(), bViews && !labels.empty()*/);
 	if (!ply.header_complete())
 		return false;
 
@@ -662,7 +663,7 @@ bool PointCloud::SavePLY(const String& fileName, bool bViews, bool bLegacyTypes,
 			vertex.label = labels[i];
 		if (!pointViews.empty()) {
 			vertex.views.num = pointViews[i].size();
-			vertex.views.pIndices = pointViews[i].data();
+			// vertex.views.pIndices = pointViews[i].data();
 		}
 		if (!pointWeights.empty()) {
 			ASSERT(vertex.views.num == pointWeights[i].size());
