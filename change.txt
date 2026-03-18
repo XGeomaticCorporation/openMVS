@@ -1,0 +1,7 @@
+1 apps\CMakeLists.txt: Commented out lines 3–5, 7–10, and 11
+2 libs\Math\CMakeLists.txt: Commented out lines 7–9 and 17
+3 libs\Common\Types.inl: Commented out line 3109
+4 libs\MVS\SceneReconstruct.cpp: Commented out lines 41, 42, and 60
+5 libs\MVS\PointCloud.cpp: Commented out lines 375–382 and 398–406
+6 apps\DensifyPointCloud\DensifyPointCloud.cpp: Modified lines 230, 534, and 541; added additional parameters: nMinPixelsFuse, fNCCThresholdKeep, fMaxAngle
+7 apps\DensifyPointCloud\InterfaceCOLMAP.cpp: Modified lines 1478
