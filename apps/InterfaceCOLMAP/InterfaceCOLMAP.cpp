@@ -1475,6 +1475,24 @@ int main(int argc, LPCTSTR* argv)
 			return EXIT_FAILURE;
 		if (!pointcloud.IsEmpty() && !pointcloud.Save(MAKE_PATH_SAFE(Util::getFileFullName(OPT::strOutputFileName)) + _T(".ply"), true))
 			return EXIT_FAILURE;
+
+		const String strImageIDsFile(strOutFolder + "image_ids.txt");
+		std::ofstream fileImageIDs(strImageIDsFile);
+		if (!fileImageIDs.good()) {
+			VERBOSE("warning: unable to create file '%s'", strImageIDsFile.c_str());
+		}
+		for(auto &a:scene.images)
+		{
+			String imageFileName(a.name);
+			uint32_t img_id = a.ID;
+			if (fileImageIDs.good()) {
+				fileImageIDs << img_id << " " << imageFileName << std::endl;
+			}
+		}
+		if (fileImageIDs.good()) {
+			LOG_OUT() << "Image IDs saved to: " << strImageIDsFile << std::endl;
+		}
+
 		VERBOSE("Exported data: %u images, %u points%s (%s)",
 			scene.images.size(), scene.vertices.size(), pointcloud.IsEmpty()?"":String::FormatString(", %d dense points", pointcloud.GetSize()).c_str(),
 			TD_TIMER_GET_FMT().c_str());
