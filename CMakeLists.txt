@@ -1,4 +1,4 @@
-# CMake powered build system for OpenMVS
+﻿# CMake powered build system for OpenMVS
 
 ########################################################################
 #
@@ -38,7 +38,7 @@ OPTION(OpenMVS_USE_FAST_FLOAT2INT "Use an optimized code to convert real numbers
 OPTION(OpenMVS_USE_FAST_INVSQRT "Use an optimized code to compute the inverse square root (slower in fact on modern compilers)" OFF)
 OPTION(OpenMVS_USE_FAST_CBRT "Use an optimized code to compute the cubic root" OFF)
 OPTION(OpenMVS_USE_SSE "Enable SSE optimizations" ON)
-OPTION(OpenMVS_MAX_CUDA_COMPATIBILITY "Build for maximum CUDA device compatibility" OFF)
+OPTION(OpenMVS_MAX_CUDA_COMPATIBILITY "Build for maximum CUDA device compatibility" ON)
 OPTION(OpenMVS_ENABLE_IPO "Whether to enable interprocedural optimization" ON)
 OPTION(OpenMVS_ENABLE_TESTS "Enable test code" OFF)
 
