@@ -224,10 +224,8 @@ __device__ inline Matrix3 ComputeHomography(const CUDA::Camera& refCamera, const
 }
 
 // weight a neighbor texel based on color similarity and distance to the center texel
-__device__ inline float ComputeBilateralWeight(int xDist, int yDist, float pix, float centerPix)
+__device__ inline float ComputeBilateralWeight(int xDist, int yDist, float pix, float centerPix, float sigmaSpatial, float sigmaColor)
 {
-	constexpr float sigmaSpatial = -1.f / (2.f * (nSizeHalfWindow-1)*(nSizeHalfWindow-1));
-	constexpr float sigmaColor = -1.f / (2.f * 25.f/255.f*25.f/255.f);
 	const float spatialDistSq = float(xDist * xDist + yDist * yDist);
 	const float colorDistSq = Square(pix - centerPix);
 	return exp(spatialDistSq * sigmaSpatial + colorDistSq * sigmaColor);
@@ -260,9 +258,14 @@ __device__ float ScorePlane(const ImagePixels refImage, const CUDA::Camera& refC
 	const Point2 pt = (H * p.cast<float>().homogeneous()).hnormalized();
 	if (pt.x() >= trgCamera.size.x() || pt.x() < 0.f || pt.y() >= trgCamera.size.y() || pt.y() < 0.f)
 		return maxCost;
-	Point3 X = H * Point2(p.x()-nSizeHalfWindow, p.y()-nSizeHalfWindow).homogeneous();
+	const int halfWindow = params.nPatchHalfWindow;
+	const int step = params.nPatchStep;
+	const float sigmaSpatialDist = float(max(1, halfWindow-1));
+	const float sigmaSpatial = -1.f / (2.f * sigmaSpatialDist * sigmaSpatialDist);
+	constexpr float sigmaColor = -1.f / (2.f * 25.f/255.f*25.f/255.f);
+	Point3 X = H * Point2(p.x()-halfWindow, p.y()-halfWindow).homogeneous();
 	Point3 baseX(X);
-	H *= float(nSizeStep);
+	H *= float(step);
 
 	float sumRef = 0.f;
 	float sumRefRef = 0.f;
@@ -271,13 +274,13 @@ __device__ float ScorePlane(const ImagePixels refImage, const CUDA::Camera& refC
 	float sumRefTrg = 0.f;
 	float bilateralWeightSum = 0.f;
 	const float refCenterPix = tex2D<float>(refImage, p.x() + 0.5f, p.y() + 0.5f);
-	for (int i = -nSizeHalfWindow; i <= nSizeHalfWindow; i += nSizeStep) {
-		for (int j = -nSizeHalfWindow; j <= nSizeHalfWindow; j += nSizeStep) {
+	for (int i = -halfWindow; i <= halfWindow; i += step) {
+		for (int j = -halfWindow; j <= halfWindow; j += step) {
 			const Point2i refPt = Point2i(p.x() + j, p.y() + i);
 			const Point2 trgPt = X.hnormalized();
 			const float refPix = tex2D<float>(refImage, refPt.x() + 0.5f, refPt.y() + 0.5f);
 			const float trgPix = tex2D<float>(trgImage, trgPt.x() + 0.5f, trgPt.y() + 0.5f);
-			const float weight = ComputeBilateralWeight(j, i, refPix, refCenterPix);
+			const float weight = ComputeBilateralWeight(j, i, refPix, refCenterPix, sigmaSpatial, sigmaColor);
 			const float weightRefPix = weight * refPix;
 			const float weightTrgPix = weight * trgPix;
 			sumRef += weightRefPix;
@@ -493,6 +496,19 @@ __device__ void ProcessPixel(const ImagePixels* images, const ImagePixels* depth
 		Point4 newPlane;
 		newPlane.topLeftCorner<3,1>() = normals[i];
 		newPlane.w() = depths[i];
+		MultiViewScorePlane(images, depthImages, cameras, p, newPlane, lowDepth, costVector, params);
+		const float costPlane = AggregateMultiViewScores(viewWeights, costVector, params.nNumViews);
+		if (cost > costPlane) {
+			cost = costPlane;
+			plane = newPlane;
+		}
+	}
+	// global random depth hypotheses: lets thin structures far from the propagated/initial surface
+	// (e.g. power lines, absent from the sparse cloud and lost at low resolution) be discovered
+	for (int i = 0; i < params.nRandomDepthHypotheses; ++i) {
+		Point4 newPlane;
+		newPlane.topLeftCorner<3,1>() = (i & 1) ? GenerateRandomNormal(cameras[0], p, randState) : Point3(plane.topLeftCorner<3,1>());
+		newPlane.w() = curand_uniform(randState) * (params.fDepthMax - params.fDepthMin) + params.fDepthMin;
 		MultiViewScorePlane(images, depthImages, cameras, p, newPlane, lowDepth, costVector, params);
 		const float costPlane = AggregateMultiViewScores(viewWeights, costVector, params.nNumViews);
 		if (cost > costPlane) {

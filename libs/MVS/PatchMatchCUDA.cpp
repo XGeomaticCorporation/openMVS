@@ -198,6 +198,9 @@ void PatchMatch::EstimateDepthMap(DepthData& depthData)
 	params.nInitTopK = MINF(params.nInitTopK, params.nNumViews);
 	params.fDepthMin = depthData.dMin;
 	params.fDepthMax = depthData.dMax;
+	params.nRandomDepthHypotheses = (int)OPTDENSE::nRandomDepthHypotheses;
+	params.nPatchHalfWindow = MAXF(1, (int)OPTDENSE::nPatchHalfWindow);
+	params.nPatchStep = MINF(MAXF(1, (int)OPTDENSE::nPatchStep), params.nPatchHalfWindow);
 	if (prevNumImages < numImages) {
 		images.resize(numImages);
 		cameras.resize(numImages);

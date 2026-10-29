@@ -122,6 +122,11 @@ MDEFVAR_OPTDENSE_float(fRandomAngle2Range, "Random Angle2 Range", "Angle 2 range
 MDEFVAR_OPTDENSE_float(fRandomSmoothDepth, "Random Smooth Depth", "Depth variance used during neighbor smoothness assignment (ratio)", "0.02")
 MDEFVAR_OPTDENSE_float(fRandomSmoothNormal, "Random Smooth Normal", "Normal variance used during neighbor smoothness assignment (degrees)", "13")
 MDEFVAR_OPTDENSE_float(fRandomSmoothBonus, "Random Smooth Bonus", "Score factor used to encourage smoothness (1 - disabled)", "0.93")
+MDEFVAR_OPTDENSE_float(fDepthRangeMinScale, "Depth Range Min Scale", "scale applied to the minimum sparse depth to obtain the lower bound of the depth search range (<0.9 allows thin structures above the sparse surface, e.g. power lines)", "0.9")
+MDEFVAR_OPTDENSE_float(fDepthRangeMaxScale, "Depth Range Max Scale", "scale applied to the maximum sparse depth to obtain the upper bound of the depth search range", "1.1")
+MDEFVAR_OPTDENSE_uint32(nRandomDepthHypotheses, "Random Depth Hypotheses", "number of random depth hypotheses sampled over the whole depth range at each CUDA patch-match refinement (0 - disabled)", "0")
+MDEFVAR_OPTDENSE_uint32(nPatchHalfWindow, "Patch Half Window", "half size of the CUDA patch-match matching window, in pixels", "4")
+MDEFVAR_OPTDENSE_uint32(nPatchStep, "Patch Step", "sampling step inside the CUDA patch-match matching window, in pixels", "2")
 }
 
 

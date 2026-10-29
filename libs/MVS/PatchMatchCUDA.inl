@@ -64,6 +64,9 @@ public:
 		bool bGeomConsistency = false;
 		bool bLowResProcessed = false;
 		float fThresholdKeepCost = 0;
+		int nRandomDepthHypotheses = 0;
+		int nPatchHalfWindow = 4;
+		int nPatchStep = 2;
 	};
 
 public:

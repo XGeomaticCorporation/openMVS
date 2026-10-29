@@ -147,6 +147,11 @@ extern float fRandomAngle2Range;
 extern float fRandomSmoothDepth;
 extern float fRandomSmoothNormal;
 extern float fRandomSmoothBonus;
+extern float fDepthRangeMinScale;
+extern float fDepthRangeMaxScale;
+extern unsigned nRandomDepthHypotheses;
+extern unsigned nPatchHalfWindow;
+extern unsigned nPatchStep;
 } // namespace OPTDENSE
 /*----------------------------------------------------------------*/
 

@@ -150,7 +150,10 @@ bool Application::Initialize(size_t argc, LPCTSTR* argv)
 	unsigned nMinPixelsFuse;
 	float fNCCThresholdKeep;
 	float fMaxAngle;
-
+	float fDepthRangeMinScale;
+	unsigned nRandomDepthHypotheses;
+	unsigned nPatchHalfWindow;
+	unsigned nPatchStep;
 	boost::program_options::options_description config("Densify options");
 	config.add_options()
 		("input-file,i", boost::program_options::value<std::string>(&OPT::strInputFileName), "input filename containing camera poses and image list")
@@ -168,6 +171,10 @@ bool Application::Initialize(size_t argc, LPCTSTR* argv)
 		("min-pixel-fuse", boost::program_options::value(&nMinPixelsFuse)->default_value(5), "minimum number of depth-estimates that agree during fusion in order to consider it (multiple pixels can be from the same depth-map)")
 		("ncc-threshold-keep", boost::program_options::value(&fNCCThresholdKeep)->default_value(0.9f), "Maximum 1-NCC score accepted for a match 0.9 0.5")
 		("max-angle", boost::program_options::value(&fMaxAngle)->default_value(65.0f), "Max angle for accepting the depth triangulation 65.0")
+		("depth-range-min-scale", boost::program_options::value(&fDepthRangeMinScale)->default_value(0.9f), "scale applied to the minimum sparse depth to obtain the lower bound of the depth search range (<0.9 allows thin structures above the surface, e.g. power lines)")
+		("random-depth-hypotheses", boost::program_options::value(&nRandomDepthHypotheses)->default_value(0), "number of random depth hypotheses sampled over the whole depth range at each CUDA patch-match refinement (0 - disabled)")
+		("patch-half-window", boost::program_options::value(&nPatchHalfWindow)->default_value(4), "half size of the CUDA patch-match matching window in pixels (5 with patch-step 1 gives an 11x11 dense window, better for thin structures, ~1.7x slower)")
+		("patch-step", boost::program_options::value(&nPatchStep)->default_value(2), "sampling step inside the CUDA patch-match matching window in pixels")
 		("ignore-mask-label", boost::program_options::value(&nIgnoreMaskLabel)->default_value(-1), "label value to ignore in the image mask, stored in the MVS scene or next to each image with '.mask.png' extension (<0 - disabled)")
 		("iters", boost::program_options::value(&nEstimationIters)->default_value(numIters), "number of patch-match iterations")
 		("geometric-iters", boost::program_options::value(&nEstimationGeometricIters)->default_value(2), "number of geometric consistent patch-match iterations (0 - disabled)")
@@ -291,6 +298,10 @@ bool Application::Initialize(size_t argc, LPCTSTR* argv)
 	OPTDENSE::nMinPixelsFuse = nMinPixelsFuse;
 	OPTDENSE::fMaxAngle = fMaxAngle;
 	OPTDENSE::fNCCThresholdKeep = fNCCThresholdKeep;
+	OPTDENSE::fDepthRangeMinScale = fDepthRangeMinScale;
+	OPTDENSE::nRandomDepthHypotheses = nRandomDepthHypotheses;
+	OPTDENSE::nPatchHalfWindow = nPatchHalfWindow;
+	OPTDENSE::nPatchStep = nPatchStep;
 
 	if (!bValidConfig && !OPT::strDenseConfigFileName.empty())
 		OPTDENSE::oConfig.Save(OPT::strDenseConfigFileName);
