@@ -32,6 +32,7 @@
 #include "Common.h"
 #include "PointCloud.h"
 #include "DepthMap.h"
+#include <filesystem>
 // GLTF: mesh import/export
 #define JSON_NOEXCEPTION
 #define TINYGLTF_NOEXCEPTION
@@ -408,6 +409,228 @@ namespace BasicPLY {
 	};
 } // namespace BasicPLY
 } // namespace PointCloudInternal
+
+namespace {
+
+class CheckedPLYStream : public OSTREAM
+{
+public:
+	explicit CheckedPLYStream(const String& fileName)
+		: file(fileName, File::WRITE, File::CREATE | File::TRUNCATE), buffer(256 * 1024), used(0), failed(!file.isOpen()) {}
+
+	bool IsGood() const { return !failed; }
+
+	size_t write(const void* data, size_t size) override {
+		if (failed)
+			return STREAM_ERROR;
+		const uint8_t* src = static_cast<const uint8_t*>(data);
+		size_t remaining = size;
+		while (remaining > 0) {
+			const size_t n = MINF(remaining, buffer.size() - used);
+			memcpy(buffer.data() + used, src, n);
+			used += n;
+			src += n;
+			remaining -= n;
+			if (used == buffer.size() && !FlushBuffer())
+				return STREAM_ERROR;
+		}
+		return size;
+	}
+
+	size_t flush() override {
+		if (!FlushBuffer() || file.flush() != 0) {
+			failed = true;
+			return STREAM_ERROR;
+		}
+		return 0;
+	}
+
+	bool setPos(size_f_t pos) override {
+		if (!FlushBuffer() || !file.setPos(pos)) {
+			failed = true;
+			return false;
+		}
+		return true;
+	}
+
+	size_f_t getPos() const override {
+		if (failed)
+			return SIZE_NA;
+		const size_f_t pos = file.getPos();
+		return pos == SIZE_NA ? SIZE_NA : pos + used;
+	}
+
+	size_f_t getSize() const override {
+		if (failed)
+			return SIZE_NA;
+		const size_f_t size = file.getSize();
+		const size_f_t pos = getPos();
+		return size == SIZE_NA || pos == SIZE_NA ? SIZE_NA : MAXF(size, pos);
+	}
+
+private:
+	bool FlushBuffer() {
+		if (failed)
+			return false;
+		if (used != 0 && file.write(buffer.data(), used) != used) {
+			failed = true;
+			return false;
+		}
+		used = 0;
+		return true;
+	}
+
+	File file;
+	std::vector<uint8_t> buffer;
+	size_t used;
+	bool failed;
+};
+
+} // namespace
+
+struct PointCloudStreamWriter::Impl
+{
+	String outputPath;
+	String temporaryDirectory;
+	String temporaryPath;
+	String scratchPath;
+	PLY ply;
+	CheckedPLYStream* stream;
+	size_t count;
+	bool colors;
+	bool normals;
+	bool ready;
+	bool directoryCreated;
+
+	Impl(const String& fileName, bool bColors, bool bNormals)
+		: outputPath(fileName), stream(NULL), count(0), colors(bColors), normals(bNormals), ready(false), directoryCreated(false)
+	{
+		Util::ensureFolder(outputPath);
+		for (unsigned attempt=0; attempt<10; ++attempt) {
+			temporaryDirectory = outputPath + _T(".stream-") + Util::getUniqueName(0) + String::FormatString(_T("-%u"), attempt);
+			std::error_code ec;
+			if (std::filesystem::create_directory(temporaryDirectory.c_str(), ec)) {
+				directoryCreated = true;
+				break;
+			}
+			if (ec) {
+				VERBOSE("error: cannot create streaming temporary directory '%s': %s", temporaryDirectory.c_str(), ec.message().c_str());
+				return;
+			}
+		}
+		if (!directoryCreated) {
+			VERBOSE("error: cannot create a unique streaming temporary directory for '%s'", outputPath.c_str());
+			return;
+		}
+		temporaryPath = temporaryDirectory + PATH_SEPARATOR_STR + _T("points.ply");
+		scratchPath = temporaryDirectory + PATH_SEPARATOR_STR + _T("masks.bin");
+		stream = new CheckedPLYStream(temporaryPath);
+		if (!stream->IsGood()) {
+			VERBOSE("error: cannot create streaming point-cloud '%s'", temporaryPath.c_str());
+			delete stream;
+			stream = NULL;
+			return;
+		}
+		using namespace PointCloudInternal;
+		ply.set_legacy_type_names();
+		ply.write(stream, 1, BasicPLY::elem_names, PLY::BINARY_LE);
+		BasicPLY::Vertex::InitSaveProps(ply, std::numeric_limits<int>::max(), bColors, bNormals, true, false);
+		if (!ply.header_complete() || !stream->IsGood()) {
+			VERBOSE("error: cannot write streaming PLY header '%s'", temporaryPath.c_str());
+			return;
+		}
+		ready = true;
+	}
+
+	~Impl() {
+		ply.release();
+		stream = NULL;
+		if (!directoryCreated)
+			return;
+		std::error_code ec;
+		std::filesystem::remove(scratchPath.c_str(), ec);
+		if (ec)
+			VERBOSE("warning: cannot remove streaming scratch file '%s': %s", scratchPath.c_str(), ec.message().c_str());
+		ec.clear();
+		std::filesystem::remove(temporaryPath.c_str(), ec);
+		if (ec)
+			VERBOSE("warning: cannot remove temporary point-cloud '%s': %s", temporaryPath.c_str(), ec.message().c_str());
+		ec.clear();
+		std::filesystem::remove(temporaryDirectory.c_str(), ec);
+		if (ec)
+			VERBOSE("warning: cannot remove streaming temporary directory '%s': %s", temporaryDirectory.c_str(), ec.message().c_str());
+	}
+};
+
+PointCloudStreamWriter::PointCloudStreamWriter(const String& fileName, bool bColors, bool bNormals)
+	: impl(new Impl(fileName, bColors, bNormals)) {}
+
+PointCloudStreamWriter::~PointCloudStreamWriter() = default;
+
+bool PointCloudStreamWriter::IsOpen() const { return impl->ready; }
+bool PointCloudStreamWriter::HasColors() const { return impl->colors; }
+bool PointCloudStreamWriter::HasNormals() const { return impl->normals; }
+size_t PointCloudStreamWriter::GetSize() const { return impl->count; }
+const String& PointCloudStreamWriter::GetScratchPath() const { return impl->scratchPath; }
+
+bool PointCloudStreamWriter::Write(const PointCloud::Point& point, const PointCloud::Color& color,
+	const PointCloud::Normal& normal, unsigned numViews)
+{
+	if (!impl->ready)
+		return false;
+	if (impl->count >= static_cast<size_t>(std::numeric_limits<int>::max())) {
+		VERBOSE("error: streaming PLY exceeds the supported vertex count");
+		return false;
+	}
+	PointCloudInternal::BasicPLY::Vertex vertex{};
+	vertex.p = point;
+	vertex.c = color;
+	vertex.n = normal;
+	vertex.views.num = static_cast<uint8_t>(numViews);
+	impl->ply.put_element(&vertex);
+	if (!impl->stream->IsGood()) {
+		VERBOSE("error: writing streaming point-cloud '%s'", impl->temporaryPath.c_str());
+		return false;
+	}
+	++impl->count;
+	return true;
+}
+
+bool PointCloudStreamWriter::Finish()
+{
+	if (!impl->ready)
+		return false;
+	if (impl->count == 0) {
+		VERBOSE("error: streaming fusion produced no points");
+		return false;
+	}
+	// The initial header uses a ten-digit placeholder so the count can be replaced in place.
+	constexpr size_f_t countOffset = sizeof("ply\nformat binary_little_endian 1.0\nelement vertex ") - 1;
+	const String count(String::FormatString(_T("%10u"), static_cast<unsigned>(impl->count)));
+	if (count.size() != 10 || !impl->stream->setPos(countOffset) ||
+		impl->stream->write(count.data(), count.size()) != count.size() ||
+		impl->stream->flush() == STREAM_ERROR)
+	{
+		VERBOSE("error: finalizing streaming point-cloud '%s'", impl->temporaryPath.c_str());
+		return false;
+	}
+	impl->ply.release();
+	impl->stream = NULL;
+	impl->ready = false;
+	#ifdef _MSC_VER
+	if (!::MoveFileEx(impl->temporaryPath.c_str(), impl->outputPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+		VERBOSE("error: cannot replace point-cloud '%s' (Windows error %lu)", impl->outputPath.c_str(), GetLastError());
+		return false;
+	}
+	#else
+	if (::rename(impl->temporaryPath.c_str(), impl->outputPath.c_str()) != 0) {
+		VERBOSE("error: cannot replace point-cloud '%s': %s", impl->outputPath.c_str(), strerror(errno));
+		return false;
+	}
+	#endif
+	return true;
+}
+/*----------------------------------------------------------------*/
 
 // load the dense point-cloud from a PLY file
 bool PointCloud::Load(const String& fileName)

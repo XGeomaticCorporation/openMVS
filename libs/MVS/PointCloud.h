@@ -36,6 +36,7 @@
 // I N C L U D E S /////////////////////////////////////////////////
 
 #include "Image.h"
+#include <memory>
 
 
 // D E F I N E S ///////////////////////////////////////////////////
@@ -132,6 +133,27 @@ public:
 		ar & colors;
 	}
 	#endif
+};
+/*----------------------------------------------------------------*/
+
+// Incremental writer for the binary PLY produced by dense fusion.
+class MVS_API PointCloudStreamWriter
+{
+public:
+	PointCloudStreamWriter(const String& fileName, bool bColors, bool bNormals);
+	~PointCloudStreamWriter();
+
+	bool IsOpen() const;
+	bool HasColors() const;
+	bool HasNormals() const;
+	bool Write(const PointCloud::Point&, const PointCloud::Color&, const PointCloud::Normal&, unsigned numViews);
+	bool Finish();
+	size_t GetSize() const;
+	const String& GetScratchPath() const;
+
+private:
+	struct Impl;
+	std::unique_ptr<Impl> impl;
 };
 /*----------------------------------------------------------------*/
 

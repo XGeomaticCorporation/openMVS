@@ -44,6 +44,7 @@ namespace MVS {
 	
 // Forward declarations
 class MVS_API Scene;
+class MVS_API PointCloudStreamWriter;
 #ifdef _USE_CUDA
 namespace CUDA {
 class PatchMatch;
@@ -71,7 +72,8 @@ public:
 	bool AdjustConfidence(DepthData& depthDataRef, const IIndexArr& idxNeighbors);
 	void MergeDepthMaps(PointCloud& pointcloud, bool bEstimateColor, bool bEstimateNormal);
 	void FuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, bool bEstimateNormal);
-	void DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, bool bEstimateNormal);
+	bool DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, bool bEstimateNormal,
+		PointCloudStreamWriter* stream=NULL, size_t streamCacheBytes=0, const OBB3f* cropROI=NULL);
 
 	static DepthData ScaleDepthData(const DepthData& inputDeptData, float scale);
 
@@ -110,9 +112,10 @@ struct MVS_API DenseDepthMapData {
 	int nEstimationGeometricIter;
 	int nFusionMode;
 	float fSampleMeshNeighbors;
+	bool bReuseDepthMaps;
 	STEREO::SemiGlobalMatcher sgm;
 
-	DenseDepthMapData(Scene& _scene, int _nFusionMode=0, float _fSampleMeshNeighbors=0);
+	DenseDepthMapData(Scene& _scene, int _nFusionMode=0, float _fSampleMeshNeighbors=0, bool _bReuseDepthMaps=false);
 	~DenseDepthMapData();
 
 	void SignalCompleteDepthmapFilter();

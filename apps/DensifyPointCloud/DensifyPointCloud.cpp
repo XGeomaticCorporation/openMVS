@@ -75,6 +75,8 @@ int nEstimateSegmentation;
 int thFilterPointCloud;
 int nExportNumViews;
 bool bForceNeighborsFromImages;
+bool bStreamFusion;
+int64_t nStreamFusionCacheMB;
 int nArchiveType;
 int nProcessPriority;
 unsigned nMaxThreads;
@@ -186,6 +188,8 @@ bool Application::Initialize(size_t argc, LPCTSTR* argv)
 		("sample-mesh", boost::program_options::value(&OPT::fSampleMesh)->default_value(0.f), "uniformly samples points on a mesh (0 - disabled, <0 - number of points, >0 - sample density per square unit)")
 		("fusion-mode", boost::program_options::value(&OPT::nFusionMode)->default_value(0), "depth-maps fusion mode (-2 - fuse disparity-maps, -1 - export disparity-maps only, 0 - depth-maps & fusion, 1 - export depth-maps only)")
 		("fusion-filter", boost::program_options::value(&nFuseFilter)->default_value(2), "filter used to fuse the depth-maps (0 - merge, 1 - fuse, 2 - dense-fuse)")
+		("stream-fusion", boost::program_options::value(&OPT::bStreamFusion)->default_value(false), "stream dense-fuse output to PLY using existing depth-maps (0 - disabled, 1 - enabled)")
+		("stream-fusion-cache-mb", boost::program_options::value(&OPT::nStreamFusionCacheMB)->default_value(2048), "streaming fusion cache budget in MiB for depth-maps, images, masks and one image decode")
 		("fusion-depth-diff-threshold,t", boost::program_options::value(&fDepthDiffThreshold)->default_value(0.01f), "maximum variance allowed for the depths during fusion")
 		("fusion-reprojection-threshold,d", boost::program_options::value(&fDepthReprojectionErrorThreshold)->default_value(1.2f), "dense-fuse maximum distance between measured and depth projected pixel")
 		("postprocess-dmaps", boost::program_options::value(&nOptimize)->default_value(0), "flags used to filter the depth-maps after estimation (0 - disabled, 1 - remove-speckles, 2 - fill-gaps, 4 - adjust-confidence)")
@@ -302,6 +306,27 @@ bool Application::Initialize(size_t argc, LPCTSTR* argv)
 	OPTDENSE::nRandomDepthHypotheses = nRandomDepthHypotheses;
 	OPTDENSE::nPatchHalfWindow = nPatchHalfWindow;
 	OPTDENSE::nPatchStep = nPatchStep;
+
+	if (OPT::bStreamFusion &&
+		(OPT::nFusionMode != 0 || OPTDENSE::nFuseFilter != OPTDENSE::FUSE_DENSEFILTER ||
+		 OPTDENSE::nOptimize != 0 || OPTDENSE::nEstimationGeometricIters != 0 ||
+		 (OPTDENSE::nEstimateColors != 0 && OPTDENSE::nEstimateColors != 2) ||
+		 (OPTDENSE::nEstimateNormals != 0 && OPTDENSE::nEstimateNormals != 2) ||
+		 OPT::nStreamFusionCacheMB <= 0 || OPT::nEstimateSegmentation != 0 ||
+		 OPT::fSampleMesh != 0 || OPT::fMaxSubsceneArea > 0 || OPT::thFilterPointCloud != 0 ||
+		 OPT::nExportNumViews != 0 || OPT::fEstimateScale != 0 || OPT::nNormalizeCoordinates != 0 ||
+		 !OPT::strExportDMAPSPathName.empty() || !OPT::strExportDepthMapsName.empty() ||
+		 !OPT::strExportSceneWithROIFileName.empty() || !OPT::strExportROIFileName.empty() ||
+		 !OPT::strCropROIFileName.empty() || !OPT::strOutputViewNeighborsFileName.empty() ||
+		 (!OPT::strImportROIFileName.empty() && !OPT::bCrop2ROI)))
+	{
+		LOG("error: --stream-fusion requires fusion-mode 0, fusion-filter 2, geometric-iters 0, postprocess-dmaps 0, colors/normals 0 or 2, a positive cache size, and no coordinate normalization or separate export/filter operation");
+		return false;
+	}
+	if (OPT::bStreamFusion && uint64_t(OPT::nStreamFusionCacheMB) > std::numeric_limits<size_t>::max() / (1024*1024)) {
+		LOG("error: --stream-fusion-cache-mb is too large");
+		return false;
+	}
 
 	if (!bValidConfig && !OPT::strDenseConfigFileName.empty())
 		OPTDENSE::oConfig.Save(OPT::strDenseConfigFileName);
@@ -518,7 +543,7 @@ int main(int argc, LPCTSTR* argv)
 		if (VERBOSITY_LEVEL > 1 && !scene.pointcloud.IsEmpty())
 			scene.pointcloud.PrintStatistics(scene.images.data(), &scene.obb);
 		#endif
-		if ((ARCHIVE_TYPE)OPT::nArchiveType == ARCHIVE_MVS)
+		if ((ARCHIVE_TYPE)OPT::nArchiveType == ARCHIVE_MVS && !OPT::bStreamFusion)
 			sparsePointCloud = scene.pointcloud;
 		if (OPT::bForceNeighborsFromImages) {
 			// force estimating neighbor views from image pairs baseline
@@ -538,6 +563,20 @@ int main(int argc, LPCTSTR* argv)
 				VERBOSE("Removed all image neighbors");
 		}
 		TD_TIMER_START();
+		if (OPT::bStreamFusion) {
+			const String baseFileName(MAKE_PATH_SAFE(Util::getFileFullName(OPT::strOutputFileName)));
+			PointCloudStreamWriter writer(baseFileName + _T(".ply"), OPTDENSE::nEstimateColors == 2, OPTDENSE::nEstimateNormals == 2);
+			if (!writer.IsOpen() || !scene.DenseReconstruction(OPT::nFusionMode, OPT::bCrop2ROI, OPT::fBorderROI,
+				OPT::fSampleMeshNeighbors, &writer, size_t(OPT::nStreamFusionCacheMB) * 1024 * 1024))
+				return EXIT_FAILURE;
+			VERBOSE("Streaming densification completed: %llu points (%s)",
+				static_cast<unsigned long long>(writer.GetSize()), TD_TIMER_GET_FMT().c_str());
+			#if TD_VERBOSE != TD_VERBOSE_OFF
+			if (VERBOSITY_LEVEL > 2)
+				scene.ExportCamerasMLP(baseFileName+_T(".mlp"), baseFileName+_T(".ply"));
+			#endif
+			return EXIT_SUCCESS;
+		}
 		if (!scene.DenseReconstruction(OPT::nFusionMode, OPT::bCrop2ROI, OPT::fBorderROI, OPT::fSampleMeshNeighbors)) {
 			if (ABS(OPT::nFusionMode) != 1)
 				return EXIT_FAILURE;
@@ -545,6 +584,9 @@ int main(int argc, LPCTSTR* argv)
 			return EXIT_SUCCESS;
 		}
 		VERBOSE("Densifying point-cloud completed: %u points (%s)", scene.pointcloud.GetSize(), TD_TIMER_GET_FMT().c_str());
+	} else if (OPT::bStreamFusion) {
+		VERBOSE("error: streaming fusion requires an input scene that is eligible for densification");
+		return EXIT_FAILURE;
 	}
 	if (OPT::nEstimateSegmentation != 0 && !scene.pointcloud.IsEmpty() && !scene.images.empty() && !scene.images.front().maskName.empty()) {
 		// segment point-cloud using image segmentation masks

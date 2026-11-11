@@ -203,7 +203,7 @@ bool DepthMapsData::InitViews(DepthData& depthData, IIndex idxNeighbor, IIndex n
 				viewTrg.camera = viewTrg.pImageData->GetCamera(scene.platforms, viewTrg.image.size());
 		} else {
 			if (DepthData::ViewData::NeedScaleImage(viewTrg.scale))
-				viewTrg.camera = viewTrg.pImageData->GetCamera(scene.platforms, Image8U::computeResize(viewTrg.pImageData->image.size(), viewTrg.scale));
+				viewTrg.camera = viewTrg.pImageData->GetCamera(scene.platforms, Image8U::computeResize(viewTrg.pImageData->GetSize(), viewTrg.scale));
 		}
 		DEBUG_EXTRA("Reference image %3u paired with image %3u", idxImage, neighbor.ID);
 	} else {
@@ -223,7 +223,7 @@ bool DepthMapsData::InitViews(DepthData& depthData, IIndex idxNeighbor, IIndex n
 					viewTrg.camera = viewTrg.pImageData->GetCamera(scene.platforms, viewTrg.image.size());
 			} else {
 				if (DepthData::ViewData::NeedScaleImage(viewTrg.scale))
-					viewTrg.camera = viewTrg.pImageData->GetCamera(scene.platforms, Image8U::computeResize(viewTrg.pImageData->image.size(), viewTrg.scale));
+					viewTrg.camera = viewTrg.pImageData->GetCamera(scene.platforms, Image8U::computeResize(viewTrg.pImageData->GetSize(), viewTrg.scale));
 			}
 		}
 		#if TD_VERBOSE != TD_VERBOSE_OFF
@@ -249,7 +249,7 @@ bool DepthMapsData::InitViews(DepthData& depthData, IIndex idxNeighbor, IIndex n
 	viewRef.camera = viewRef.pImageData->camera;
 	if (loadImages)
 		viewRef.pImageData->image.toGray(viewRef.image, cv::COLOR_BGR2GRAY, true);
-	depthData.size = viewRef.pImageData->image.size();
+	depthData.size = viewRef.pImageData->GetSize();
 
 	// initialize views
 	for (IIndex i=1; i<depthData.images.size(); ) {
@@ -1334,7 +1334,8 @@ size_t GetAvailableMemory(const DepthDataArr& arrDepthData, const BoolArr& fused
 } // GetAvailableMemory
 
 // finds the best depth-map to fuse next that maximizes the number of neighbors already in cache
-std::tuple<unsigned, unsigned, unsigned> FetchBestNextDMapIndex(const DepthDataArr& arrDepthData, const DMapCache& cacheDMaps, const BoolArr& fusedDMaps) {
+template <typename Cache>
+std::tuple<unsigned, unsigned, unsigned> FetchBestNextDMapIndex(const DepthDataArr& arrDepthData, const Cache& cacheDMaps, const BoolArr& fusedDMaps) {
 	const IIndexArr cachedImages = cacheDMaps.GetCachedImageIndices(true);
 	IIndex bestImageIdx = NO_ID;
 	unsigned bestImageScore = 0, bestImageSize = std::numeric_limits<unsigned>::max();
@@ -1364,6 +1365,313 @@ std::tuple<unsigned, unsigned, unsigned> FetchBestNextDMapIndex(const DepthDataA
 	}
 	return std::make_tuple(bestImageIdx, bestImageScore, static_cast<unsigned>(cachedImages.size()));
 } // FetchBestNextDMapIndex
+
+namespace {
+
+class StreamingFusionCache
+{
+public:
+	StreamingFusionCache(DepthDataArr& depthData, ImageArr& images, cList<BitMatrix,const BitMatrix&,1,16,IIndex>& masks,
+		const String& scratchPath, size_t maxBytes, bool colors)
+		: depthData(depthData), images(images), masks(masks), scratchPath(scratchPath),
+		  maxBytes(maxBytes), usedBytes(0), colors(colors), entries(depthData.size()) {}
+
+	~StreamingFusionCache() {
+		scratch.close();
+		for (IIndex id=0; id<entries.size(); ++id) {
+			masks[id].release();
+			if (entries[id].cached) {
+				depthData[id].Release();
+				images[id].ReleaseImage();
+			}
+		}
+	}
+
+	bool Initialize() {
+		if (maxBytes == 0) {
+			VERBOSE("error: streaming fusion cache size must be greater than zero");
+			return false;
+		}
+		scratch.open(scratchPath, File::RW, File::CREATE | File::TRUNCATE);
+		if (!scratch.isOpen()) {
+			VERBOSE("error: cannot create streaming mask file '%s'", scratchPath.c_str());
+			return false;
+		}
+		size_f_t offset(0);
+		unsigned valid(0);
+		FOREACH(id, depthData) {
+			const DepthData& data = depthData[id];
+			if (!data.IsValid())
+				continue;
+			Entry& entry = entries[id];
+			const String fileName(ComposeDepthFilePath(data.GetView().GetID(), "dmap"));
+			File file(fileName, File::READ, File::OPEN);
+			HeaderDepthDataRaw header;
+			uint16_t nameLength;
+			uint32_t numIDs, firstID;
+			if (!file.isOpen() || file.read(&header, sizeof(header)) != sizeof(header) ||
+				header.name != HeaderDepthDataRaw::HeaderDepthDataRawName() ||
+				(header.type & HeaderDepthDataRaw::HAS_DEPTH) == 0 ||
+				header.depthWidth == 0 || header.depthHeight == 0 ||
+				header.imageWidth != header.depthWidth || header.imageHeight != header.depthHeight ||
+				header.depthWidth != static_cast<uint32_t>(data.size.width) ||
+				header.depthHeight != static_cast<uint32_t>(data.size.height) ||
+				file.read(&nameLength, sizeof(nameLength)) != sizeof(nameLength) ||
+				!file.setPos(sizeof(header) + sizeof(nameLength) + nameLength) ||
+				file.read(&numIDs, sizeof(numIDs)) != sizeof(numIDs) ||
+				numIDs == 0 || numIDs >= 256 ||
+				file.read(&firstID, sizeof(firstID)) != sizeof(firstID) ||
+				firstID != data.GetView().GetID())
+			{
+				VERBOSE("error: invalid or mismatched depth-map '%s'; regenerate it at the requested resolution", fileName.c_str());
+				return false;
+			}
+			const uint64_t pixels = uint64_t(header.depthWidth) * header.depthHeight;
+			if (pixels > uint64_t(std::numeric_limits<int>::max() - BitMatrix::numBitsPerCell)) {
+				VERBOSE("error: depth-map '%s' is too large for fusion masks", fileName.c_str());
+				return false;
+			}
+			const uint64_t bytesPerPixel = sizeof(float) +
+				((header.type & HeaderDepthDataRaw::HAS_NORMAL) ? 3*sizeof(float) : 0) +
+				((header.type & HeaderDepthDataRaw::HAS_CONF) ? sizeof(float) : 0) +
+				((header.type & HeaderDepthDataRaw::HAS_VIEWS) ? 4*sizeof(uint8_t) : 0);
+			const uint64_t expectedSize = sizeof(header) + sizeof(nameLength) + nameLength +
+				sizeof(numIDs) + uint64_t(numIDs)*sizeof(uint32_t) + 21*sizeof(double) + pixels*bytesPerPixel;
+			const size_f_t fileSize = file.getSize();
+			if (fileSize == SIZE_NA || uint64_t(fileSize) < expectedSize) {
+				VERBOSE("error: truncated depth-map '%s'", fileName.c_str());
+				return false;
+			}
+			const size_f_t poseOffset = sizeof(header) + sizeof(nameLength) + nameLength +
+				sizeof(numIDs) + size_f_t(numIDs)*sizeof(uint32_t);
+			REAL storedPose[21];
+			if (!file.setPos(poseOffset) || file.read(storedPose, sizeof(storedPose)) != sizeof(storedPose)) {
+				VERBOSE("error: cannot read camera parameters from depth-map '%s'", fileName.c_str());
+				return false;
+			}
+			const Camera& camera = data.GetView().camera;
+			const REAL* const expectedPose[] = {camera.K.val, camera.R.val, camera.C.ptr()};
+			const unsigned poseLengths[] = {9, 9, 3};
+			unsigned poseIndex = 0;
+			for (unsigned part=0; part<3; ++part) {
+				for (unsigned i=0; i<poseLengths[part]; ++i, ++poseIndex) {
+					const REAL expected = expectedPose[part][i];
+					const REAL stored = storedPose[poseIndex];
+					if (!std::isfinite(expected) || !std::isfinite(stored) ||
+						std::abs(expected-stored) > 1e-8 * MAXF(REAL(1), MAXF(std::abs(expected), std::abs(stored))))
+					{
+						VERBOSE("error: camera parameters do not match depth-map '%s'; use the original scene or regenerate depth-maps", fileName.c_str());
+						return false;
+					}
+				}
+			}
+			entry.maskOffset = offset;
+			entry.maskBytes = size_t((pixels + BitMatrix::numBitsPerCell - 1) / BitMatrix::numBitsPerCell) * sizeof(BitMatrix::Type);
+			if (offset > std::numeric_limits<size_f_t>::max() - entry.maskBytes) {
+				VERBOSE("error: streaming mask file is too large");
+				return false;
+			}
+			offset += entry.maskBytes;
+			const size_t residentPixelBytes = sizeof(float) + 3*sizeof(float) +
+				((header.type & HeaderDepthDataRaw::HAS_CONF) ? sizeof(float) : 0) +
+				(colors ? 3*sizeof(uint8_t) : 0);
+			const size_t matrixOverhead = sizeof(DepthMap::Base) + sizeof(NormalMap::Base) +
+				((header.type & HeaderDepthDataRaw::HAS_CONF) ? sizeof(ConfidenceMap::Base) : 0) +
+				(colors ? sizeof(Image8U3::Base) : 0);
+			if (pixels > (std::numeric_limits<size_t>::max() - matrixOverhead) / residentPixelBytes) {
+				VERBOSE("error: depth-map '%s' exceeds the addressable cache size", fileName.c_str());
+				return false;
+			}
+			entry.residentEstimate = size_t(pixels) * residentPixelBytes + matrixOverhead;
+			if (colors) {
+				IMAGEPTR imageHeader(Image::ReadImageHeader(images[id].name));
+				if (imageHeader == NULL) {
+					VERBOSE("error: cannot read image header '%s'", images[id].name.c_str());
+					return false;
+				}
+				const uint64_t width = imageHeader->GetWidth();
+				const uint64_t height = imageHeader->GetHeight();
+				if (width == 0 || height == 0 ||
+					width > uint64_t(std::numeric_limits<size_t>::max()) / 3 / height) {
+					VERBOSE("error: image '%s' has invalid dimensions or is too large", images[id].name.c_str());
+					return false;
+				}
+				entry.decodeBytes = static_cast<size_t>(width * height * 3);
+			}
+			++valid;
+		}
+		if (valid == 0) {
+			VERBOSE("error: no depth-maps are available for streaming fusion");
+			return false;
+		}
+		VERBOSE("Streaming fusion cache: %llu MiB; mask scratch up to %llu MiB",
+			static_cast<unsigned long long>(maxBytes / (1024*1024)),
+			static_cast<unsigned long long>((offset + 1024*1024-1) / (1024*1024)));
+		return true;
+	}
+
+	bool HasMask(IIndex id) const { return entries[id].initialized; }
+
+	IIndexArr GetCachedImageIndices(bool ordered) const {
+		IIndexArr result;
+		FOREACH(id, depthData)
+			if (entries[id].usedForScheduling)
+				result.push_back(id);
+		if (ordered)
+			result.Sort();
+		return result;
+	}
+
+	bool Pin(IIndex id) {
+		Entry& entry = entries[id];
+		if (entry.pinned)
+			return true;
+		size_t required = entry.maskBytes;
+		if (!entry.cached) {
+			if (entry.residentEstimate > std::numeric_limits<size_t>::max() - required ||
+				entry.decodeBytes > std::numeric_limits<size_t>::max() - required - entry.residentEstimate)
+			{
+				VERBOSE("error: streaming cache size overflow for image %u", id);
+				return false;
+			}
+			required += entry.residentEstimate + entry.decodeBytes;
+		}
+		if (!MakeRoom(required))
+			return false;
+		if (!entry.cached) {
+			DepthData& data = depthData[id];
+			const String fileName(ComposeDepthFilePath(data.GetView().GetID(), "dmap"));
+			if (!data.Load(fileName, HeaderDepthDataRaw::HAS_DEPTH | HeaderDepthDataRaw::HAS_NORMAL | HeaderDepthDataRaw::HAS_CONF)) {
+				VERBOSE("error: cannot load depth-map '%s'", fileName.c_str());
+				data.Release();
+				return false;
+			}
+			if (data.normalMap.empty() && !EstimateNormalMap(data.GetView().camera.K, data.depthMap, data.normalMap)) {
+				VERBOSE("error: cannot estimate normals for depth-map '%s'", fileName.c_str());
+				data.Release();
+				return false;
+			}
+			if (colors) {
+				Image& image = images[id];
+				const cv::Size expectedSize(image.GetSize());
+				if (!image.ReloadImage(MAXF(expectedSize.width, expectedSize.height)) || image.GetSize() != expectedSize || image.image.size() != expectedSize) {
+					VERBOSE("error: cannot load image '%s' at its depth-map resolution", image.name.c_str());
+					data.Release();
+					image.ReleaseImage();
+					return false;
+				}
+			}
+			entry.residentBytes = data.GetMemorySize() + (colors ? images[id].image.memory_size() : 0);
+			if (entry.residentBytes > entry.residentEstimate) {
+				VERBOSE("error: streaming cache estimate exceeded for image %u (%llu bytes used, %llu estimated)",
+					id, static_cast<unsigned long long>(entry.residentBytes), static_cast<unsigned long long>(entry.residentEstimate));
+				data.Release();
+				images[id].ReleaseImage();
+				return false;
+			}
+			usedBytes += entry.residentBytes;
+			lru.push_front(id);
+			entry.position = lru.begin();
+			entry.cached = true;
+			// Keep the fusion order independent of physical cache evictions.
+			entry.usedForScheduling = true;
+		} else {
+			lru.splice(lru.begin(), lru, entry.position);
+			entry.position = lru.begin();
+		}
+		BitMatrix& mask = masks[id];
+		mask.create(depthData[id].size);
+		if (entry.initialized) {
+			if (!scratch.setPos(entry.maskOffset) || scratch.read(mask.data, entry.maskBytes) != entry.maskBytes) {
+				VERBOSE("error: cannot read streaming fusion mask for image %u", id);
+				mask.release();
+				return false;
+			}
+		} else {
+			mask.memset(0);
+			entry.initialized = true;
+		}
+		usedBytes += entry.maskBytes;
+		entry.pinned = true;
+		return true;
+	}
+
+	bool FinishRound() {
+		FOREACH(id, depthData) {
+			Entry& entry = entries[id];
+			if (!entry.pinned)
+				continue;
+			BitMatrix& mask = masks[id];
+			if (!scratch.setPos(entry.maskOffset) || scratch.write(mask.data, entry.maskBytes) != entry.maskBytes) {
+				VERBOSE("error: cannot write streaming fusion mask for image %u", id);
+				return false;
+			}
+			mask.release();
+			usedBytes -= entry.maskBytes;
+			entry.pinned = false;
+		}
+		return true;
+	}
+
+	bool Finish() {
+		if (scratch.flush() != 0) {
+			VERBOSE("error: cannot flush streaming fusion masks '%s'", scratchPath.c_str());
+			return false;
+		}
+		return true;
+	}
+
+private:
+	struct Entry {
+		bool cached = false;
+		bool pinned = false;
+		bool initialized = false;
+		bool usedForScheduling = false;
+		size_t maskBytes = 0;
+		size_t residentEstimate = 0;
+		size_t residentBytes = 0;
+		size_t decodeBytes = 0;
+		size_f_t maskOffset = 0;
+		std::list<IIndex>::iterator position;
+	};
+
+	bool MakeRoom(size_t required) {
+		while (required > maxBytes || usedBytes > maxBytes - required) {
+			auto it = lru.end();
+			while (it != lru.begin()) {
+				--it;
+				if (!entries[*it].pinned)
+					break;
+			}
+			if (it == lru.end() || entries[*it].pinned) {
+				VERBOSE("error: active depth-maps, images and masks need more than the %llu MiB streaming cache; increase --stream-fusion-cache-mb",
+					static_cast<unsigned long long>(maxBytes / (1024*1024)));
+				return false;
+			}
+			const IIndex id(*it);
+			Entry& entry = entries[id];
+			usedBytes -= entry.residentBytes;
+			depthData[id].Release();
+			images[id].ReleaseImage();
+			entry.cached = false;
+			lru.erase(it);
+		}
+		return true;
+	}
+
+	DepthDataArr& depthData;
+	ImageArr& images;
+	cList<BitMatrix,const BitMatrix&,1,16,IIndex>& masks;
+	String scratchPath;
+	size_t maxBytes;
+	size_t usedBytes;
+	bool colors;
+	std::vector<Entry> entries;
+	std::list<IIndex> lru;
+	File scratch;
+};
+
+} // namespace
 
 // fuse all valid depth-maps in the same 3D point-cloud;
 // join points very likely to represent the same 3D point and
@@ -1620,7 +1928,8 @@ void DepthMapsData::FuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, b
 // fuse all valid depth-maps in the same 3D point-cloud;
 // join points very likely to represent the same 3D point and
 // filter out points blocking the view
-void DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, bool _bEstimateNormal)
+bool DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, bool _bEstimateNormal,
+	PointCloudStreamWriter* stream, size_t streamCacheBytes, const OBB3f* cropROI)
 {
 	TD_TIMER_STARTD();
 
@@ -1637,30 +1946,45 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 	size_t nDepths(0);
 	UseMaskArr arrUseMask(arrDepthData.size());
 	const size_t nPointsEstimate(arrDepthData.size() * 9000); //TODO: better estimate number of points
-	pointcloud.points.reserve(nPointsEstimate);
-	pointcloud.pointViews.reserve(nPointsEstimate);
-	pointcloud.pointWeights.reserve(nPointsEstimate);
+	if (!stream) {
+		pointcloud.points.reserve(nPointsEstimate);
+		pointcloud.pointViews.reserve(nPointsEstimate);
+		pointcloud.pointWeights.reserve(nPointsEstimate);
+	}
 	unsigned depthDataLoadFlags(HeaderDepthDataRaw::HAS_DEPTH | HeaderDepthDataRaw::HAS_CONF);
-	if (bEstimateColor)
+	if (bEstimateColor && !stream)
 		pointcloud.colors.reserve(nPointsEstimate);
 	if (bEstimateNormal) {
-		pointcloud.normals.reserve(nPointsEstimate);
+		if (!stream)
+			pointcloud.normals.reserve(nPointsEstimate);
 		depthDataLoadFlags |= HeaderDepthDataRaw::HAS_NORMAL;
+	}
+	BoolArr fusedDMaps(arrDepthData.size());
+	fusedDMaps.Memset(0);
+	DMapCache cacheDMaps(arrDepthData, depthDataLoadFlags, stream ? 0 : GetAvailableMemory(arrDepthData, fusedDMaps, numDMapsReserveFusion));
+	std::unique_ptr<StreamingFusionCache> streamCache;
+	if (stream) {
+		streamCache.reset(new StreamingFusionCache(arrDepthData, scene.images, arrUseMask, stream->GetScratchPath(), streamCacheBytes, bEstimateColor));
+		if (!streamCache->Initialize())
+			return false;
 	}
 	Util::Progress progress(_T("Dense fused depth-maps"), arrDepthData.size());
 	GET_LOGCONSOLE().Pause();
-	BoolArr fusedDMaps(arrDepthData.size());
-	fusedDMaps.Memset(0);
-	DMapCache cacheDMaps(arrDepthData, depthDataLoadFlags, GetAvailableMemory(arrDepthData, fusedDMaps, numDMapsReserveFusion));
+	const auto fail = [&]() {
+		GET_LOGCONSOLE().Play();
+		progress.close();
+		return false;
+	};
 	unsigned totalNumImageNeighborsInCache = 0, totalNumImagesInCache = 0;
+	size_t numFusedPoints(0);
 	BoolArr neighbors(arrDepthData.size());
 	PointCloud::Point refPoint;
 	PointCloud::Normal refNormal;
 	CLISTDEF0IDX(float, unsigned) fusedPoints[3];
 	PointCloud::ViewArr fusedViews;
 	FloatArr fusedWeights;
-	Point3d fusedNormal;
-	Pixel32F fusedColor;
+	Point3d fusedNormal(Point3d::ZERO);
+	Pixel32F fusedColor(Pixel32F::BLACK);
 	const auto FusePoint = [&](IIndex ID, const ImageRef& x, unsigned fuseDepth) -> void {
 		const auto lambda = [&](IIndex ID, const ImageRef& x, unsigned fuseDepth, const auto& FusePointImpl) -> void {
 			const DepthData& depthData = arrDepthData[ID];
@@ -1713,12 +2037,14 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 				fusedPoints[0].push_back(X(0));
 				fusedPoints[1].push_back(X(1));
 				fusedPoints[2].push_back(X(2));
-				const float weight(Conf2Weight(conf, depth));
 				const auto it(fusedViews.InsertSortUnique(ID));
-				if (it.second)
-					fusedWeights[it.first] += weight;
-				else
-					fusedWeights.InsertAt(it.first, weight);
+				if (!stream) {
+					const float weight(Conf2Weight(conf, depth));
+					if (it.second)
+						fusedWeights[it.first] += weight;
+					else
+						fusedWeights.InsertAt(it.first, weight);
+				}
 				if (bEstimateNormal)
 					fusedNormal += Cast<double>(normal);
 				if (bEstimateColor)
@@ -1752,25 +2078,44 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 	while (true) {
 		TD_TIMER_STARTD();
 		// find the best depth-map to fuse next as the one with the most neighbors already in cache
-		const auto [idxImage, numImageNeighborsInCache, numImagesInCache] = FetchBestNextDMapIndex(arrDepthData, cacheDMaps, fusedDMaps);
+		const auto [idxImage, numImageNeighborsInCache, numImagesInCache] = stream
+			? FetchBestNextDMapIndex(arrDepthData, *streamCache, fusedDMaps)
+			: FetchBestNextDMapIndex(arrDepthData, cacheDMaps, fusedDMaps);
 		if (idxImage == NO_ID)
 			break; // no more depth-maps to fuse (only invalid depth-maps left)
 		totalNumImageNeighborsInCache += numImageNeighborsInCache;
 		totalNumImagesInCache += numImagesInCache;
 		++numDMapsFused;
 		// fuse depth-map
-		cacheDMaps.UseImage(idxImage);
-		cacheDMaps.SkipMemoryCheckIdxImage(idxImage);
+		if (stream) {
+			if (!streamCache->Pin(idxImage))
+				return fail();
+		} else {
+			cacheDMaps.UseImage(idxImage);
+			cacheDMaps.SkipMemoryCheckIdxImage(idxImage);
+		}
 		const DepthData& depthData(arrDepthData[idxImage]);
 		ASSERT(depthData.GetView().GetLocalID(scene.images) == idxImage);
 		ASSERT(!depthData.IsEmpty());
-		if (bEstimateNormal && depthData.normalMap.empty())
+		if (!stream && bEstimateNormal && depthData.normalMap.empty())
 			EstimateNormalMaps();
 		// make sure all neighbors are cached
 		neighbors.Memset(0);
 		neighbors[idxImage] = true;
 		IIndex numNeighbors(0);
 		ASSERT(!depthData.images.empty() && !depthData.neighbors.empty());
+		if (stream) {
+			for (const ViewScore& neighbor: depthData.neighbors) {
+				if (!arrDepthData[neighbor.ID].IsValid())
+					continue;
+				const bool hadMask(streamCache->HasMask(neighbor.ID));
+				if (!streamCache->Pin(neighbor.ID))
+					return fail();
+				neighbors[neighbor.ID] = true;
+				if (!hadMask && ++numNeighbors >= OPTDENSE::nMaxViewsFuse)
+					break;
+			}
+		} else {
 		#ifdef DENSE_USE_OPENMP
 		bool bAbort(false);
 		#pragma omp parallel for
@@ -1803,6 +2148,7 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 				#endif
 			}
 		}
+		}
 		ASSERT(!depthData.IsEmpty());
 		MAYBEUNUSED const Image& imageData = *depthData.images.front().pImageData;
 		ASSERT(&imageData-scene.images.data() == idxImage);
@@ -1813,26 +2159,41 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 			useMask.memset(0);
 		}
 		// try to fuse each depth estimate
-		const size_t nNumPointsPrev(pointcloud.points.size());
+		const size_t nNumPointsPrev(stream ? numFusedPoints : pointcloud.points.size());
 		for (int i=0; i<depthData.size.height; ++i) {
 			for (int j=0; j<depthData.size.width; ++j) {
 				FusePoint(idxImage, ImageRef(j,i), 0);
 				if (fusedPoints[0].size() >= OPTDENSE::nMinPixelsFuse && fusedViews.size() >= nMinViewsFuse) {
 					// create the corresponding 3D point
-					pointcloud.points.emplace_back(
+					const PointCloud::Point point(
 						fusedPoints[0].GetMedian(),
 						fusedPoints[1].GetMedian(),
 						fusedPoints[2].GetMedian()
 					);
-					ASSERT(fusedViews.size() == fusedWeights.size());
-					PointCloud::WeightArr& weights = pointcloud.pointWeights.AddEmpty();
-					for (float weight: fusedWeights)
-						weights.push_back(weight);
-					pointcloud.pointViews.emplace_back(fusedViews);
-					if (bEstimateNormal)
-						pointcloud.normals.emplace_back(normalized(fusedNormal));
-					if (bEstimateColor)
-						pointcloud.colors.emplace_back((fusedColor/static_cast<float>(fusedPoints[0].size())).cast<uint8_t>());
+					++numFusedPoints;
+					if (stream) {
+						if (!cropROI || cropROI->Intersects(point)) {
+							PointCloud::Normal normal(0, 0, 0);
+							PointCloud::Color color(0, 0, 0);
+							if (_bEstimateNormal)
+								normal = normalized(fusedNormal);
+							if (bEstimateColor)
+								color = (fusedColor/static_cast<float>(fusedPoints[0].size())).cast<uint8_t>();
+							if (!stream->Write(point, color, normal, fusedViews.size()))
+								return fail();
+						}
+					} else {
+						pointcloud.points.emplace_back(point);
+						ASSERT(fusedViews.size() == fusedWeights.size());
+						PointCloud::WeightArr& weights = pointcloud.pointWeights.AddEmpty();
+						for (float weight: fusedWeights)
+							weights.push_back(weight);
+						pointcloud.pointViews.emplace_back(fusedViews);
+						if (bEstimateNormal)
+							pointcloud.normals.emplace_back(normalized(fusedNormal));
+						if (bEstimateColor)
+							pointcloud.colors.emplace_back((fusedColor/static_cast<float>(fusedPoints[0].size())).cast<uint8_t>());
+					}
 				}
 				if (!fusedViews.empty()) {
 					nDepths += fusedViews.size();
@@ -1848,25 +2209,40 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 		}
 		fusedDMaps[idxImage] = true;
 		ASSERT(pointcloud.points.size() == pointcloud.pointViews.size() && pointcloud.points.size() == pointcloud.pointWeights.size());
-		DEBUG_ULTIMATE("Depth-map for reference image %3u fused using %u depth-maps: %u new points, %u/%u cached images (%s)",
-			idxImage, depthData.images.size() - 1, pointcloud.points.size() - nNumPointsPrev, numImageNeighborsInCache, numImagesInCache, TD_TIMER_GET_FMT().c_str());
+		DEBUG_ULTIMATE("Depth-map for reference image %3u fused using %u depth-maps: %llu new points, %u/%u cached images (%s)",
+			idxImage, depthData.images.size() - 1,
+			static_cast<unsigned long long>((stream ? numFusedPoints : pointcloud.points.size()) - nNumPointsPrev),
+			numImageNeighborsInCache, numImagesInCache, TD_TIMER_GET_FMT().c_str());
 		progress.display(numDMapsFused);
 		// ensure enough memory is available for the next depth-maps chunk
-		cacheDMaps.SkipMemoryCheckIdxImage();
-		if (numDMapsFused % numDMapsReserveFusion == 0)
-			cacheDMaps.SetMaxMemory(GetAvailableMemory(arrDepthData, fusedDMaps, numDMapsReserveFusion, cacheDMaps.GetUsedMemory()));
+		if (stream) {
+			if (!streamCache->FinishRound())
+				return fail();
+		} else {
+			cacheDMaps.SkipMemoryCheckIdxImage();
+			if (numDMapsFused % numDMapsReserveFusion == 0)
+				cacheDMaps.SetMaxMemory(GetAvailableMemory(arrDepthData, fusedDMaps, numDMapsReserveFusion, cacheDMaps.GetUsedMemory()));
+		}
 	}
+	if (stream && !streamCache->Finish())
+		return fail();
 	GET_LOGCONSOLE().Play();
 	progress.close();
+	streamCache.reset();
 	arrUseMask.Release();
 	cacheDMaps.ClearCache();
 	if (!_bEstimateNormal)
 		pointcloud.normals.Release();
 
-	DEBUG_EXTRA("Depth-maps dense fused and filtered: %u depth-maps, %u depths, %u points (%d%%%%), %.2f hits in %.2f cached (%s)",
-		numDMapsFused, nDepths, pointcloud.points.size(), ROUND2INT((100.f*pointcloud.points.size())/nDepths),
-		static_cast<double>(totalNumImageNeighborsInCache) / numDMapsFused,
-		static_cast<double>(totalNumImagesInCache) / numDMapsFused, TD_TIMER_GET_FMT().c_str());
+	DEBUG_EXTRA("Depth-maps dense fused and filtered: %u depth-maps, %llu depths, %llu points (%d%%%%), %.2f hits in %.2f cached (%s)",
+		numDMapsFused, static_cast<unsigned long long>(nDepths), static_cast<unsigned long long>(numFusedPoints),
+		nDepths ? ROUND2INT((100.f*numFusedPoints)/nDepths) : 0,
+		numDMapsFused ? static_cast<double>(totalNumImageNeighborsInCache) / numDMapsFused : 0.,
+		numDMapsFused ? static_cast<double>(totalNumImagesInCache) / numDMapsFused : 0., TD_TIMER_GET_FMT().c_str());
+	if (stream && cropROI)
+		VERBOSE("Point-cloud trimmed to ROI: %llu points removed",
+			static_cast<unsigned long long>(numFusedPoints - stream->GetSize()));
+	return true;
 } // DenseFuseDepthMaps
 /*----------------------------------------------------------------*/
 
@@ -1874,9 +2250,9 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 
 // S T R U C T S ///////////////////////////////////////////////////
 
-DenseDepthMapData::DenseDepthMapData(Scene& _scene, int _nFusionMode, float _fSampleMeshNeighbors) :
+DenseDepthMapData::DenseDepthMapData(Scene& _scene, int _nFusionMode, float _fSampleMeshNeighbors, bool _bReuseDepthMaps) :
 	scene(_scene), depthMaps(_scene), idxImage(0), sem(1), nEstimationGeometricIter(-1),
-	nFusionMode(_nFusionMode), fSampleMeshNeighbors(_fSampleMeshNeighbors)
+	nFusionMode(_nFusionMode), fSampleMeshNeighbors(_fSampleMeshNeighbors), bReuseDepthMaps(_bReuseDepthMaps)
 {
 	if (nFusionMode < 0) {
 		STEREO::SemiGlobalMatcher::CreateThreads(scene.nMaxThreads);
@@ -1905,9 +2281,25 @@ void DenseDepthMapData::SignalCompleteDepthmapFilter()
 static void* DenseReconstructionEstimateTmp(void*);
 static void* DenseReconstructionFilterTmp(void*);
 
-bool Scene::DenseReconstruction(int nFusionMode, bool bCrop2ROI, float fBorderROI, float fSampleMeshNeighbors)
+bool Scene::DenseReconstruction(int nFusionMode, bool bCrop2ROI, float fBorderROI, float fSampleMeshNeighbors,
+	PointCloudStreamWriter* stream, size_t streamCacheBytes)
 {
-	DenseDepthMapData data(*this, nFusionMode, fSampleMeshNeighbors);
+	if (stream && (!stream->IsOpen() || streamCacheBytes == 0 || nFusionMode != 0 ||
+		OPTDENSE::nFuseFilter != OPTDENSE::FUSE_DENSEFILTER || OPTDENSE::nOptimize != 0 ||
+		OPTDENSE::nEstimationGeometricIters != 0 ||
+		(OPTDENSE::nEstimateColors != 0 && OPTDENSE::nEstimateColors != 2) ||
+		(OPTDENSE::nEstimateNormals != 0 && OPTDENSE::nEstimateNormals != 2)))
+	{
+		VERBOSE("error: streaming fusion requires dense-fuse, existing depth-maps, no depth-map postprocessing, and colors/normals set to 0 or 2");
+		return false;
+	}
+	if (stream && (stream->HasColors() != (OPTDENSE::nEstimateColors == 2) ||
+		stream->HasNormals() != (OPTDENSE::nEstimateNormals == 2)))
+	{
+		VERBOSE("error: streaming PLY properties do not match the requested color and normal estimation");
+		return false;
+	}
+	DenseDepthMapData data(*this, nFusionMode, fSampleMeshNeighbors, stream != NULL);
 
 	// estimate depth-maps
 	if (!ComputeDepthMaps(data))
@@ -1917,6 +2309,9 @@ bool Scene::DenseReconstruction(int nFusionMode, bool bCrop2ROI, float fBorderRO
 
 	// fuse all depth-maps
 	pointcloud.Release();
+	const OBB3f ROI(bCrop2ROI && IsBounded()
+		? (fBorderROI == 0 ? obb : (fBorderROI > 0 ? OBB3f(obb).EnlargePercent(fBorderROI) : OBB3f(obb).Enlarge(-fBorderROI)))
+		: OBB3f(true));
 	switch (OPTDENSE::nFuseFilter) {
 	case OPTDENSE::FUSE_NOFILTER:
 		// merge depth-maps
@@ -1928,10 +2323,14 @@ bool Scene::DenseReconstruction(int nFusionMode, bool bCrop2ROI, float fBorderRO
 		break;
 	case OPTDENSE::FUSE_DENSEFILTER:
 		// dense fuse depth-maps
-		data.depthMaps.DenseFuseDepthMaps(pointcloud, OPTDENSE::nEstimateColors == 2, OPTDENSE::nEstimateNormals == 2);
+		if (!data.depthMaps.DenseFuseDepthMaps(pointcloud, OPTDENSE::nEstimateColors == 2, OPTDENSE::nEstimateNormals == 2,
+			stream, streamCacheBytes, stream && bCrop2ROI && IsBounded() ? &ROI : NULL))
+			return false;
 	}
+	if (stream && !stream->Finish())
+		return false;
 	#if TD_VERBOSE != TD_VERBOSE_OFF
-	if (g_nVerbosityLevel > 2) {
+	if (!stream && g_nVerbosityLevel > 2) {
 		// print number of points with 3+ views
 		size_t nPoints1m(0), nPoints2(0), nPoints3p(0);
 		FOREACHPTR(pViews, pointcloud.pointViews) {
@@ -1956,7 +2355,6 @@ bool Scene::DenseReconstruction(int nFusionMode, bool bCrop2ROI, float fBorderRO
 		if (bCrop2ROI && IsBounded()) {
 			TD_TIMER_START();
 			const size_t numPoints = pointcloud.GetSize();
-			const OBB3f ROI(fBorderROI == 0 ? obb : (fBorderROI > 0 ? OBB3f(obb).EnlargePercent(fBorderROI) : OBB3f(obb).Enlarge(-fBorderROI)));
 			pointcloud.RemovePointsOutside(ROI);
 			VERBOSE("Point-cloud trimmed to ROI: %u points removed (%s)",
 				numPoints-pointcloud.GetSize(), TD_TIMER_GET_FMT().c_str());
@@ -2036,7 +2434,9 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 			// reload image at the appropriate resolution
 			unsigned nResolutionLevel(OPTDENSE::nResolutionLevel);
 			const unsigned nMaxResolution(imageData.RecomputeMaxResolution(nResolutionLevel, OPTDENSE::nMinResolution, OPTDENSE::nMaxResolution));
-			if (!imageData.ReloadImage(nMaxResolution)) {
+			if (data.bReuseDepthMaps)
+				imageData.ReleaseImage();
+			if (!imageData.ReloadImage(nMaxResolution, !data.bReuseDepthMaps)) {
 				#ifdef DENSE_USE_OPENMP
 				bAbort = true;
 				#pragma omp flush (bAbort)
@@ -2095,9 +2495,32 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 			imagesMap[data.images[idx]] = NO_ID;
 			data.images.RemoveAt(idx);
 		}
-		ASSERT(!data.images.IsEmpty());
+		if (data.images.IsEmpty()) {
+			VERBOSE("error: no images suitable for dense reconstruction");
+			return false;
+		}
 		VERBOSE("Selecting images for dense reconstruction completed: %d images (%s)", data.images.GetSize(), TD_TIMER_GET_FMT().c_str());
 	}
+	}
+
+	if (data.bReuseDepthMaps) {
+		unsigned numValid(0);
+		for (IIndex idxImage: data.images) {
+			DepthData& depthData = data.depthMaps.arrDepthData[idxImage];
+			if (!data.depthMaps.InitViews(depthData, NO_ID, OPTDENSE::nNumViews, false, -1))
+				continue;
+			const String fileName(ComposeDepthFilePath(depthData.GetView().GetID(), "dmap"));
+			if (!File::access(fileName)) {
+				VERBOSE("error: streaming fusion requires the existing depth-map '%s'", fileName.c_str());
+				return false;
+			}
+			++numValid;
+		}
+		if (numValid == 0) {
+			VERBOSE("error: no valid depth-maps available for streaming fusion");
+			return false;
+		}
+		return true;
 	}
 
 	#ifdef _USE_CUDA
