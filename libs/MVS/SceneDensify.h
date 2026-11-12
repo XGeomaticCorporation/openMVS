@@ -41,6 +41,7 @@
 // S T R U C T S ///////////////////////////////////////////////////
 
 namespace MVS {
+struct AdaptiveSimplifyOptions;
 	
 // Forward declarations
 class MVS_API Scene;
@@ -73,7 +74,8 @@ public:
 	void MergeDepthMaps(PointCloud& pointcloud, bool bEstimateColor, bool bEstimateNormal);
 	void FuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, bool bEstimateNormal);
 	bool DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, bool bEstimateNormal,
-		PointCloudStreamWriter* stream=NULL, size_t streamCacheBytes=0, const OBB3f* cropROI=NULL);
+		PointCloudStreamWriter* stream=NULL, size_t streamCacheBytes=0, const OBB3f* cropROI=NULL,
+		const AdaptiveSimplifyOptions* simplify=NULL);
 
 	static DepthData ScaleDepthData(const DepthData& inputDeptData, float scale);
 

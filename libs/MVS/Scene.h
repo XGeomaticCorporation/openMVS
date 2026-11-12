@@ -139,7 +139,7 @@ public:
 	
 	// Dense reconstruction
 	bool DenseReconstruction(int nFusionMode=0, bool bCrop2ROI=true, float fBorderROI=0, float fSampleMeshNeighbors=0,
-		PointCloudStreamWriter* stream=NULL, size_t streamCacheBytes=0);
+		PointCloudStreamWriter* stream=NULL, size_t streamCacheBytes=0, const AdaptiveSimplifyOptions* simplify=NULL);
 	bool ComputeDepthMaps(DenseDepthMapData& data);
 	void DenseReconstructionEstimate(void*);
 	void DenseReconstructionFilter(void*);

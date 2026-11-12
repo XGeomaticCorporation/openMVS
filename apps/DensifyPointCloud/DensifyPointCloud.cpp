@@ -31,6 +31,7 @@
 
 #include "../../libs/MVS/Common.h"
 #include "../../libs/MVS/Scene.h"
+#include "../../libs/MVS/PointCloudSimplify.h"
 #include <boost/program_options.hpp>
 
 using namespace MVS;
@@ -77,6 +78,9 @@ int nExportNumViews;
 bool bForceNeighborsFromImages;
 bool bStreamFusion;
 int64_t nStreamFusionCacheMB;
+bool bSimplifyAdaptive;
+AdaptiveSimplifyOptions simplifyOptions;
+int64_t nSimplifyMemoryMB;
 int nArchiveType;
 int nProcessPriority;
 unsigned nMaxThreads;
@@ -188,8 +192,14 @@ bool Application::Initialize(size_t argc, LPCTSTR* argv)
 		("sample-mesh", boost::program_options::value(&OPT::fSampleMesh)->default_value(0.f), "uniformly samples points on a mesh (0 - disabled, <0 - number of points, >0 - sample density per square unit)")
 		("fusion-mode", boost::program_options::value(&OPT::nFusionMode)->default_value(0), "depth-maps fusion mode (-2 - fuse disparity-maps, -1 - export disparity-maps only, 0 - depth-maps & fusion, 1 - export depth-maps only)")
 		("fusion-filter", boost::program_options::value(&nFuseFilter)->default_value(2), "filter used to fuse the depth-maps (0 - merge, 1 - fuse, 2 - dense-fuse)")
-		("stream-fusion", boost::program_options::value(&OPT::bStreamFusion)->default_value(false), "stream dense-fuse output to PLY using existing depth-maps (0 - disabled, 1 - enabled)")
+		("stream-fusion", boost::program_options::value(&OPT::bStreamFusion)->default_value(false), "stream dense-fuse output to PLY; missing depth-maps are estimated first (0 - disabled, 1 - enabled)")
 		("stream-fusion-cache-mb", boost::program_options::value(&OPT::nStreamFusionCacheMB)->default_value(2048), "streaming fusion cache budget in MiB for depth-maps, images, masks and one image decode")
+		("simplify-adaptive", boost::program_options::value(&OPT::bSimplifyAdaptive)->default_value(false), "feature-adaptive simplification: thin flat areas, keep edges, thin structures and texture (requires stream-fusion)")
+		("simplify-min-spacing", boost::program_options::value(&OPT::simplifyOptions.minSpacing)->default_value(1.0), "sample spacing / local surface GSD on features, in [0.5,max-spacing]")
+		("simplify-max-spacing", boost::program_options::value(&OPT::simplifyOptions.maxSpacing)->default_value(2.0), "sample spacing / local surface GSD on flat areas, in [min-spacing,4]")
+		("simplify-error", boost::program_options::value(&OPT::simplifyOptions.error)->default_value(0.5), "maximum offset of a removed point from the retained point tangent plane / local surface GSD, in (0,2]")
+		("simplify-transition", boost::program_options::value(&OPT::simplifyOptions.transition)->default_value(30.0), "distance / median surface GSD over which the sample spacing may at most double (0 - no limit), in [0,1000]")
+		("simplify-memory-mb", boost::program_options::value(&OPT::nSimplifyMemoryMB)->default_value(256), "simplification tile working budget in MiB, independent of fusion cache")
 		("fusion-depth-diff-threshold,t", boost::program_options::value(&fDepthDiffThreshold)->default_value(0.01f), "maximum variance allowed for the depths during fusion")
 		("fusion-reprojection-threshold,d", boost::program_options::value(&fDepthReprojectionErrorThreshold)->default_value(1.2f), "dense-fuse maximum distance between measured and depth projected pixel")
 		("postprocess-dmaps", boost::program_options::value(&nOptimize)->default_value(0), "flags used to filter the depth-maps after estimation (0 - disabled, 1 - remove-speckles, 2 - fill-gaps, 4 - adjust-confidence)")
@@ -326,6 +336,19 @@ bool Application::Initialize(size_t argc, LPCTSTR* argv)
 	if (OPT::bStreamFusion && uint64_t(OPT::nStreamFusionCacheMB) > std::numeric_limits<size_t>::max() / (1024*1024)) {
 		LOG("error: --stream-fusion-cache-mb is too large");
 		return false;
+	}
+	if (OPT::bSimplifyAdaptive) {
+		if (!OPT::bStreamFusion || OPT::nSimplifyMemoryMB < 1 ||
+			uint64_t(OPT::nSimplifyMemoryMB) > std::numeric_limits<size_t>::max()/(1024*1024))
+		{
+			LOG("error: --simplify-adaptive requires --stream-fusion 1 and a positive, representable memory budget");
+			return false;
+		}
+		OPT::simplifyOptions.memoryBytes = size_t(OPT::nSimplifyMemoryMB)*1024*1024;
+		if (!OPT::simplifyOptions.IsValid()) {
+			LOG("error: simplify spacing must satisfy 0.5 <= min <= max <= 4, error must be in (0,2] and transition in [0,1000]");
+			return false;
+		}
 	}
 
 	if (!bValidConfig && !OPT::strDenseConfigFileName.empty())
@@ -567,7 +590,8 @@ int main(int argc, LPCTSTR* argv)
 			const String baseFileName(MAKE_PATH_SAFE(Util::getFileFullName(OPT::strOutputFileName)));
 			PointCloudStreamWriter writer(baseFileName + _T(".ply"), OPTDENSE::nEstimateColors == 2, OPTDENSE::nEstimateNormals == 2);
 			if (!writer.IsOpen() || !scene.DenseReconstruction(OPT::nFusionMode, OPT::bCrop2ROI, OPT::fBorderROI,
-				OPT::fSampleMeshNeighbors, &writer, size_t(OPT::nStreamFusionCacheMB) * 1024 * 1024))
+				OPT::fSampleMeshNeighbors, &writer, size_t(OPT::nStreamFusionCacheMB) * 1024 * 1024,
+				OPT::bSimplifyAdaptive ? &OPT::simplifyOptions : NULL))
 				return EXIT_FAILURE;
 			VERBOSE("Streaming densification completed: %llu points (%s)",
 				static_cast<unsigned long long>(writer.GetSize()), TD_TIMER_GET_FMT().c_str());

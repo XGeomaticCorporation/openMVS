@@ -34,6 +34,7 @@
 #include "SceneDensify.h"
 #include "PatchMatchCUDA.h"
 #include "DMapCache.h"
+#include "PointCloudSimplify.h"
 
 using namespace MVS;
 
@@ -1929,9 +1930,20 @@ void DepthMapsData::FuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, b
 // join points very likely to represent the same 3D point and
 // filter out points blocking the view
 bool DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, bool _bEstimateNormal,
-	PointCloudStreamWriter* stream, size_t streamCacheBytes, const OBB3f* cropROI)
+	PointCloudStreamWriter* stream, size_t streamCacheBytes, const OBB3f* cropROI,
+	const AdaptiveSimplifyOptions* simplify)
 {
 	TD_TIMER_STARTD();
+	if (simplify && (!stream || !simplify->IsValid())) {
+		VERBOSE("error: adaptive simplification requires streaming fusion and valid options");
+		return false;
+	}
+	std::unique_ptr<PointCloudAdaptiveSimplifier> simplifier;
+	if (simplify) {
+		simplifier.reset(new PointCloudAdaptiveSimplifier(*stream,*simplify));
+		if (!simplifier->IsOpen())
+			return false;
+	}
 
 	typedef SEACAVE::BitMatrix UseMask;
 	typedef CLISTDEFIDX(UseMask,IIndex) UseMaskArr;
@@ -2175,12 +2187,24 @@ bool DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 						if (!cropROI || cropROI->Intersects(point)) {
 							PointCloud::Normal normal(0, 0, 0);
 							PointCloud::Color color(0, 0, 0);
-							if (_bEstimateNormal)
+							if (_bEstimateNormal || simplifier)
 								normal = normalized(fusedNormal);
 							if (bEstimateColor)
 								color = (fusedColor/static_cast<float>(fusedPoints[0].size())).cast<uint8_t>();
-							if (!stream->Write(point, color, normal, fusedViews.size()))
+							if (simplifier) {
+								std::vector<double> scales;
+								for (IIndex view : fusedViews) {
+									const double gsd = SurfacePixelSize(arrDepthData[view].GetView().camera,Point3d(point),Point3d(normal));
+									if (gsd > 0)
+										scales.push_back(gsd);
+								}
+								std::sort(scales.begin(),scales.end());
+								const double gsd = scales.empty() ? 0 : scales[size_t(0.2*double(scales.size()-1))];
+								if (!simplifier->Write(point,color,normal,fusedViews.size(),gsd))
+									return fail();
+							} else if (!stream->Write(point, color, normal, fusedViews.size())) {
 								return fail();
+							}
 						}
 					} else {
 						pointcloud.points.emplace_back(point);
@@ -2231,6 +2255,9 @@ bool DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 	streamCache.reset();
 	arrUseMask.Release();
 	cacheDMaps.ClearCache();
+	const size_t numCroppedPoints(simplifier ? simplifier->GetInputSize() : (stream ? stream->GetSize() : 0));
+	if (simplifier && !simplifier->Finish())
+		return false;
 	if (!_bEstimateNormal)
 		pointcloud.normals.Release();
 
@@ -2241,7 +2268,7 @@ bool DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 		numDMapsFused ? static_cast<double>(totalNumImagesInCache) / numDMapsFused : 0., TD_TIMER_GET_FMT().c_str());
 	if (stream && cropROI)
 		VERBOSE("Point-cloud trimmed to ROI: %llu points removed",
-			static_cast<unsigned long long>(numFusedPoints - stream->GetSize()));
+			static_cast<unsigned long long>(numFusedPoints - numCroppedPoints));
 	return true;
 } // DenseFuseDepthMaps
 /*----------------------------------------------------------------*/
@@ -2282,15 +2309,19 @@ static void* DenseReconstructionEstimateTmp(void*);
 static void* DenseReconstructionFilterTmp(void*);
 
 bool Scene::DenseReconstruction(int nFusionMode, bool bCrop2ROI, float fBorderROI, float fSampleMeshNeighbors,
-	PointCloudStreamWriter* stream, size_t streamCacheBytes)
+	PointCloudStreamWriter* stream, size_t streamCacheBytes, const AdaptiveSimplifyOptions* simplify)
 {
+	if (simplify && (!stream || !simplify->IsValid())) {
+		VERBOSE("error: adaptive simplification requires streaming fusion and valid options");
+		return false;
+	}
 	if (stream && (!stream->IsOpen() || streamCacheBytes == 0 || nFusionMode != 0 ||
 		OPTDENSE::nFuseFilter != OPTDENSE::FUSE_DENSEFILTER || OPTDENSE::nOptimize != 0 ||
 		OPTDENSE::nEstimationGeometricIters != 0 ||
 		(OPTDENSE::nEstimateColors != 0 && OPTDENSE::nEstimateColors != 2) ||
 		(OPTDENSE::nEstimateNormals != 0 && OPTDENSE::nEstimateNormals != 2)))
 	{
-		VERBOSE("error: streaming fusion requires dense-fuse, existing depth-maps, no depth-map postprocessing, and colors/normals set to 0 or 2");
+		VERBOSE("error: streaming fusion requires dense-fuse, no depth-map postprocessing or geometric iterations, and colors/normals set to 0 or 2");
 		return false;
 	}
 	if (stream && (stream->HasColors() != (OPTDENSE::nEstimateColors == 2) ||
@@ -2298,6 +2329,13 @@ bool Scene::DenseReconstruction(int nFusionMode, bool bCrop2ROI, float fBorderRO
 	{
 		VERBOSE("error: streaming PLY properties do not match the requested color and normal estimation");
 		return false;
+	}
+	if (stream) {
+		// estimate the missing depth-maps first (existing ones are skipped and each one is
+		// released after saving), then stream the fusion from the depth-map files
+		DenseDepthMapData estimate(*this, nFusionMode, fSampleMeshNeighbors);
+		if (!ComputeDepthMaps(estimate))
+			return false;
 	}
 	DenseDepthMapData data(*this, nFusionMode, fSampleMeshNeighbors, stream != NULL);
 
@@ -2324,7 +2362,7 @@ bool Scene::DenseReconstruction(int nFusionMode, bool bCrop2ROI, float fBorderRO
 	case OPTDENSE::FUSE_DENSEFILTER:
 		// dense fuse depth-maps
 		if (!data.depthMaps.DenseFuseDepthMaps(pointcloud, OPTDENSE::nEstimateColors == 2, OPTDENSE::nEstimateNormals == 2,
-			stream, streamCacheBytes, stream && bCrop2ROI && IsBounded() ? &ROI : NULL))
+			stream, streamCacheBytes, stream && bCrop2ROI && IsBounded() ? &ROI : NULL, simplify))
 			return false;
 	}
 	if (stream && !stream->Finish())
@@ -2511,8 +2549,10 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 				continue;
 			const String fileName(ComposeDepthFilePath(depthData.GetView().GetID(), "dmap"));
 			if (!File::access(fileName)) {
-				VERBOSE("error: streaming fusion requires the existing depth-map '%s'", fileName.c_str());
-				return false;
+				// the estimation produced no depth-map for this view
+				VERBOSE("warning: depth-map '%s' not available, view skipped by streaming fusion", fileName.c_str());
+				depthData.images.Release();
+				continue;
 			}
 			++numValid;
 		}
