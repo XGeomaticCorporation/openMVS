@@ -71,6 +71,16 @@ non-streaming run's cache eviction or parallel scheduling changes the order of
 fusion or selection of neighbors. ROI cropping can change record order even when
 the point sets are identical.
 
+The streaming fusion uses all `--max-threads` threads and its output is
+byte-identical for any thread count. Each reference depth-map is split into
+row strips that are fused speculatively in parallel without touching the shared
+pixel masks (recording which pixels each point would claim and which it skipped);
+the strips are then committed strictly in row order, re-checking every speculative
+point against the current masks and recomputing serially only the few that conflict.
+The PLY is written by a background thread, and the missing depth maps of the next
+reference image are loaded in the background while the current one is fused.
+A larger `--stream-fusion-cache-mb` reduces reloading from disk.
+
 The existing PLY writer limits the output to 2,147,483,647 vertices; exceeding
 this limit fails without replacing the destination. As in the normal mode,
 `--remove-dmaps 1` deletes depth maps after a successful fusion.
@@ -132,6 +142,13 @@ processing order and therefore the exact sample set slightly (the guarantees abo
 do not change). The fusion cache is released before simplification. Allow about
 100 bytes of temporary disk space per input point in addition to the PLY and visit
 masks. An I/O error aborts without replacing an existing destination PLY.
+
+Each tile is processed with all `--max-threads` threads, with byte-identical output
+for any thread count: parallel sorts with total orders, the spacing transition as a
+parallel label-correcting shortest path (monotonic rounding makes it converge to the
+same values as Dijkstra), and the Poisson-disk selection as a deterministic parallel
+greedy (a point only depends on the covering points ranked before it: it is removed
+once one of them is retained and retained once all of them are removed).
 
 Reduction depends on how much of the scene is flat and untextured and on point
 density relative to GSD; there is no fixed ratio. Validation with the default

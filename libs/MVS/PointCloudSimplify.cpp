@@ -1,6 +1,9 @@
 #include "Common.h"
 #include "PointCloudSimplify.h"
 #include <array>
+#include <atomic>
+#include <execution>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -115,6 +118,15 @@ struct PointCloudAdaptiveSimplifier::Impl {
 	double g0 = 0, gcap = 0, halo = 0, tileSize = 0;
 	int64_t nx = 0, ny = 0;
 	bool ready = false, finished = false, failed = false, ownsDirectory = false;
+	// time spent in each stage (seconds)
+	double timePartition = 0, timeLoad = 0, timeSort = 0, timeFeatures = 0, timeGradient = 0, timeSelect = 0, timeEmit = 0;
+	typedef std::chrono::steady_clock Clock;
+	static double Lap(Clock::time_point& t) {
+		const Clock::time_point now(Clock::now());
+		const double elapsed(std::chrono::duration<double>(now-t).count());
+		t = now;
+		return elapsed;
+	}
 
 	Impl(PointCloudStreamWriter& w, const AdaptiveSimplifyOptions& o) : writer(w), options(o) {
 		if (!writer.IsOpen() || !options.IsValid()) {
@@ -318,53 +330,86 @@ struct PointCloudAdaptiveSimplifier::Impl {
 			keys[i] = Pack(index(p.x,origin.x), index(p.y,origin.y), index(p.z,origin.z));
 		}
 		std::vector<uint64_t> voxels(keys);
-		std::sort(voxels.begin(), voxels.end());
+		std::sort(std::execution::par, voxels.begin(), voxels.end());
 		voxels.erase(std::unique(voxels.begin(), voxels.end()), voxels.end());
 		const auto find = [&voxels](uint64_t key) {
 			const auto it = std::lower_bound(voxels.begin(), voxels.end(), key);
 			return it != voxels.end() && *it == key ? size_t(it-voxels.begin()) : voxels.size();
 		};
+		const size_t numVoxels = voxels.size();
 		std::vector<uint32_t> voxelOf(n);
-		std::vector<double> value(voxels.size(), std::numeric_limits<double>::max());
+		std::vector<std::atomic<double>> value(numVoxels);
+		for (auto& v : value)
+			v.store(std::numeric_limits<double>::max(), std::memory_order_relaxed);
 		for (size_t i=0; i<n; ++i) {
 			voxelOf[i] = uint32_t(find(keys[i]));
-			value[voxelOf[i]] = std::min(value[voxelOf[i]], std::log(double(radius[i])));
+			std::atomic<double>& v = value[voxelOf[i]];
+			v.store(std::min(v.load(std::memory_order_relaxed), std::log(double(radius[i]))), std::memory_order_relaxed);
 		}
 		keys = std::vector<uint64_t>();
-		typedef std::pair<double,uint32_t> Item;
-		std::priority_queue<Item, std::vector<Item>, std::greater<Item>> heap;
-		for (size_t v=0; v<voxels.size(); ++v)
-			heap.emplace(value[v], uint32_t(v));
+		// Parallel label-correcting propagation: every voxel whose value decreased relaxes its 26 neighbors
+		// until nothing changes. Since rounding is monotonic, any label-correcting order converges to
+		// exactly the same values as Dijkstra (the minimum over all paths of the accumulated costs).
+		double step[4];
+		for (int k=1; k<4; ++k)
+			step[k] = slope*cell*std::sqrt(double(k));
+		std::vector<std::atomic<uint8_t>> queued(numVoxels);
+		for (auto& q : queued)
+			q.store(1, std::memory_order_relaxed);
+		std::vector<uint32_t> frontier(numVoxels);
+		for (size_t v=0; v<numVoxels; ++v)
+			frontier[v] = uint32_t(v);
 		constexpr uint64_t mask = (uint64_t(1) << gridBits)-1;
-		while (!heap.empty()) {
-			const Item item = heap.top();
-			heap.pop();
-			if (item.first > value[item.second])
-				continue;
-			const uint64_t key = voxels[item.second];
-			const int64_t x = int64_t(key >> (2*gridBits)), y = int64_t((key >> gridBits) & mask), z = int64_t(key & mask);
-			for (int dx=-1; dx<=1; ++dx)
-				for (int dy=-1; dy<=1; ++dy)
-					for (int dz=-1; dz<=1; ++dz) {
-						if (!dx && !dy && !dz)
-							continue;
-						const int64_t ax = x+dx, ay = y+dy, az = z+dz;
-						if (ax < 0 || ay < 0 || az < 0 || ax > gridMax || ay > gridMax || az > gridMax)
-							continue;
-						const size_t v = find(Pack(ax,ay,az));
-						if (v == voxels.size())
-							continue;
-						const double candidate = item.first + slope*cell*std::sqrt(double(dx*dx+dy*dy+dz*dz));
-						if (candidate < value[v]) {
-							value[v] = candidate;
-							heap.emplace(candidate, uint32_t(v));
+		while (!frontier.empty()) {
+			std::vector<uint32_t> next;
+			#ifdef _USE_OPENMP
+			#pragma omp parallel
+			#endif
+			{
+				std::vector<uint32_t> local;
+				#ifdef _USE_OPENMP
+				#pragma omp for schedule(dynamic, 4096) nowait
+				#endif
+				for (int64_t k=0; k<int64_t(frontier.size()); ++k) {
+					const uint32_t u = frontier[size_t(k)];
+					// clear the flag before reading the value: a later decrease queues the voxel again
+					queued[u].store(0);
+					const double base = value[u].load();
+					const uint64_t key = voxels[u];
+					const int64_t x = int64_t(key >> (2*gridBits)), y = int64_t((key >> gridBits) & mask), z = int64_t(key & mask);
+					for (int64_t ax=std::max(int64_t(0),x-1); ax<=std::min(gridMax,x+1); ++ax)
+						for (int64_t ay=std::max(int64_t(0),y-1); ay<=std::min(gridMax,y+1); ++ay) {
+							// the voxels of a (x,y) column are contiguous and sorted by z
+							const uint64_t hi = Pack(ax, ay, std::min(gridMax, z+1));
+							for (auto it=std::lower_bound(voxels.begin(), voxels.end(), Pack(ax, ay, std::max(int64_t(0), z-1))); it!=voxels.end() && *it<=hi; ++it) {
+								const int64_t dz = int64_t(*it & mask)-z;
+								const int d2 = int((ax-x)*(ax-x)+(ay-y)*(ay-y)+dz*dz);
+								if (!d2)
+									continue;
+								const double candidate = base + step[d2];
+								const size_t v = size_t(it-voxels.begin());
+								double current = value[v].load(std::memory_order_relaxed);
+								while (candidate < current) {
+									if (value[v].compare_exchange_weak(current, candidate)) {
+										if (!queued[v].exchange(1))
+											local.push_back(uint32_t(v));
+										break;
+									}
+								}
+							}
 						}
-					}
+				}
+				#ifdef _USE_OPENMP
+				#pragma omp critical(simplifyFrontier)
+				#endif
+				next.insert(next.end(), local.begin(), local.end());
+			}
+			frontier.swap(next);
 		}
 		// half voxel diagonal bounds the variation inside a voxel
 		const double inside = slope*cell*0.87;
 		for (size_t i=0; i<n; ++i)
-			radius[i] = std::min(radius[i], float(std::exp(value[voxelOf[i]]+inside)));
+			radius[i] = std::min(radius[i], float(std::exp(value[voxelOf[i]].load(std::memory_order_relaxed)+inside)));
 	}
 
 	bool ProcessTile(int64_t t, const TileFile& info) {
@@ -374,6 +419,7 @@ struct PointCloudAdaptiveSimplifier::Impl {
 			borders.erase(borders.begin());
 		if (!info.core)
 			return Erase(info.path);
+		Clock::time_point lap(Clock::now());
 		std::vector<Record> records(info.count);
 		{
 			std::ifstream in(info.path, std::ios::binary);
@@ -386,6 +432,7 @@ struct PointCloudAdaptiveSimplifier::Impl {
 		++tiles;
 		maxTilePoints = std::max(maxTilePoints, records.size());
 		const size_t n = records.size();
+		timeLoad += Lap(lap);
 
 		// spatial grid: records sorted by cell, cells in (x,y,z) order so z-ranges are contiguous
 		double zmin = std::numeric_limits<double>::max(), zmax = -zmin;
@@ -412,7 +459,7 @@ struct PointCloudAdaptiveSimplifier::Impl {
 			std::vector<std::pair<uint64_t,uint32_t>> order(n);
 			for (size_t i=0; i<n; ++i)
 				order[i] = {key(Point3d(records[i].point)), uint32_t(i)};
-			std::sort(order.begin(), order.end(), [&](const auto& a, const auto& b) {
+			std::sort(std::execution::par, order.begin(), order.end(), [&](const auto& a, const auto& b) {
 				return a.first < b.first || (a.first == b.first && records[a.second].id < records[b.second].id);
 			});
 			std::vector<Record> sorted(n);
@@ -446,6 +493,7 @@ struct PointCloudAdaptiveSimplifier::Impl {
 				}
 		};
 		const auto localGSD = [&](const Record& r) { return std::min(double(r.gsd), gcap); };
+		timeSort += Lap(lap);
 
 		// feature score: 0 - flat untextured surface, 1 - edge, corner, line or strong texture;
 		// the neighborhood is wide enough (3 GSD) that depth noise alone stays near the flat end
@@ -508,8 +556,10 @@ struct PointCloudAdaptiveSimplifier::Impl {
 			sigma[size_t(i)] = float(deviation);
 			radius[size_t(i)] = float(g*(minSpacing+(maxSpacing-minSpacing)*(1-s)));
 		}
+		timeFeatures += Lap(lap);
 		if (options.transition > 0)
 			LimitSpacingGradient(records, origin, extent, radius);
+		timeGradient += Lap(lap);
 
 		// halo points already decided by previous tiles keep their decision and radius
 		std::vector<uint8_t> accepted(n, 0);
@@ -533,7 +583,7 @@ struct PointCloudAdaptiveSimplifier::Impl {
 			}
 		}
 		// variable-radius Poisson-disk selection of original points; features are visited first
-		std::sort(queue.begin(), queue.end(), [&](uint32_t a, uint32_t b) {
+		std::sort(std::execution::par, queue.begin(), queue.end(), [&](uint32_t a, uint32_t b) {
 			if (score[a] != score[b])
 				return score[a] > score[b];
 			if (records[a].views != records[b].views)
@@ -541,7 +591,18 @@ struct PointCloudAdaptiveSimplifier::Impl {
 			const uint64_t ha = Mix(records[a].id), hb = Mix(records[b].id);
 			return ha < hb || (ha == hb && records[a].id < records[b].id);
 		});
-		for (uint32_t i : queue) {
+		// The greedy selection accepts a point if no previously accepted point covers it. It is computed in parallel
+		// with the same result: a point only looks at the covering points ranked before it (halo points first);
+		// it is rejected as soon as one of them is accepted, accepted once all of them are rejected,
+		// otherwise it is decided in a later round. The queue is processed in windows to bound the re-checks.
+		enum : uint8_t { UNDECIDED = 0, ACCEPTED = 1, REJECTED = 2 };
+		std::vector<uint32_t> rank(n, 0);
+		for (size_t k=0; k<queue.size(); ++k)
+			rank[queue[k]] = uint32_t(k+1);
+		std::vector<std::atomic<uint8_t>> state(n);
+		for (size_t i=0; i<n; ++i)
+			state[i].store(records[i].halo ? (accepted[i] ? ACCEPTED : REJECTED) : UNDECIDED, std::memory_order_relaxed);
+		const auto decide = [&](uint32_t i) -> uint8_t {
 			const Record& r = records[i];
 			const double rp = radius[i];
 			const double tolerance = options.error*localGSD(r);
@@ -549,9 +610,13 @@ struct PointCloudAdaptiveSimplifier::Impl {
 			// thickness of the noisy surface band treated as a single layer
 			const double band = std::min(tolerance+2.5*double(sigma[i]), rp);
 			const Point3d normal(normals[i]), centroid(centroids[i]);
-			bool covered = false;
+			const uint32_t ri = rank[i];
+			bool covered = false, pending = false;
 			forEach(Point3d(r.point), std::sqrt(rp*rp+band*band), [&](size_t j, const Point3d& d) {
-				if (!accepted[j])
+				if (rank[j] >= ri)
+					return false;
+				const uint8_t sj = state[j].load(std::memory_order_acquire);
+				if (sj == REJECTED)
 					return false;
 				const double rr = std::min(rp, double(radius[j]));
 				const double distSq = normSq(d), offset = normal.dot(d);
@@ -560,13 +625,43 @@ struct PointCloudAdaptiveSimplifier::Impl {
 					return false;
 				// a point off the local surface (another layer or a small detail) is kept,
 				// unless it is closer than the minimum spacing
-				covered = distSq <= floorSq || (std::abs(offset) <= band &&
-					std::abs(normal.dot(Point3d(centroids[j])-centroid)) <= tolerance);
-				return covered;
+				if (!(distSq <= floorSq || (std::abs(offset) <= band &&
+					std::abs(normal.dot(Point3d(centroids[j])-centroid)) <= tolerance)))
+					return false;
+				if (sj == ACCEPTED)
+					return covered = true;
+				pending = true;
+				return false;
 			});
-			if (!covered)
-				accepted[i] = 1;
+			return covered ? REJECTED : pending ? UNDECIDED : ACCEPTED;
+		};
+		constexpr size_t window = 1 << 18;
+		std::vector<uint32_t> pendingPoints;
+		for (size_t w0=0; w0<queue.size(); w0+=window) {
+			pendingPoints.assign(queue.begin()+w0, queue.begin()+std::min(queue.size(), w0+window));
+			while (!pendingPoints.empty()) {
+				std::vector<uint8_t> decided(pendingPoints.size(), 0);
+				#ifdef _USE_OPENMP
+				#pragma omp parallel for schedule(dynamic, 256)
+				#endif
+				for (int64_t k=0; k<int64_t(pendingPoints.size()); ++k) {
+					const uint32_t i = pendingPoints[size_t(k)];
+					const uint8_t result = decide(i);
+					if (result != UNDECIDED) {
+						state[i].store(result, std::memory_order_release);
+						decided[size_t(k)] = 1;
+					}
+				}
+				size_t m = 0;
+				for (size_t k=0; k<pendingPoints.size(); ++k)
+					if (!decided[k])
+						pendingPoints[m++] = pendingPoints[k];
+				pendingPoints.resize(m);
+			}
 		}
+		for (size_t i=0; i<n; ++i)
+			accepted[i] = state[i].load(std::memory_order_relaxed) == ACCEPTED;
+		timeSelect += Lap(lap);
 		auto& border = borders[t];
 		for (size_t i=0; i<n; ++i) {
 			const Record& r = records[i];
@@ -583,6 +678,7 @@ struct PointCloudAdaptiveSimplifier::Impl {
 			if (DistanceToTileEdge(r.point, tx, ty) <= halo)
 				border.emplace(r.id, radius[i]);
 		}
+		timeEmit += Lap(lap);
 		return true;
 	}
 
@@ -602,8 +698,10 @@ struct PointCloudAdaptiveSimplifier::Impl {
 		ny = int64_t(height/tileSize)+1;
 		if (nx > (int64_t(1)<<20) || ny > (int64_t(1)<<20))
 			return Error("too many simplification tiles");
+		Clock::time_point lap(Clock::now());
 		if (!Partition())
 			return false;
+		timePartition += Lap(lap);
 		while (!tileFiles.empty()) {
 			const auto it = tileFiles.begin();
 			if (!ProcessTile(it->first, it->second))
@@ -630,6 +728,9 @@ struct PointCloudAdaptiveSimplifier::Impl {
 		if (spooled)
 			VERBOSE("Adaptive simplification tiles: %llu tiles of %.6g x %.6g, halo %.6g, largest %llu points (including halo)",
 				static_cast<unsigned long long>(tiles), tileSize, tileSize, halo, static_cast<unsigned long long>(maxTilePoints));
+		if (spooled)
+			VERBOSE("Adaptive simplification time: partition %.1fs, load %.1fs, sort %.1fs, features %.1fs, gradient %.1fs, select %.1fs, emit %.1fs",
+				timePartition, timeLoad, timeSort, timeFeatures, timeGradient, timeSelect, timeEmit);
 		if (maxGSD > 0)
 			VERBOSE("Dense surface GSD (scene units): min %.6g, approximate p10/p50/p90 %.6g/%.6g/%.6g, max %.6g",
 				minGSD, Quantile(0.1), Quantile(0.5), Quantile(0.9), maxGSD);

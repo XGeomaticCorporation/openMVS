@@ -35,6 +35,11 @@
 #include "PatchMatchCUDA.h"
 #include "DMapCache.h"
 #include "PointCloudSimplify.h"
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <mutex>
+#include <thread>
 
 using namespace MVS;
 
@@ -1369,6 +1374,55 @@ std::tuple<unsigned, unsigned, unsigned> FetchBestNextDMapIndex(const DepthDataA
 
 namespace {
 
+// small open-addressing set of non-zero keys, cleared in time proportional to its size
+class FlatKeySet
+{
+public:
+	FlatKeySet() : table(1u<<12, 0) {}
+	void clear() {
+		for (size_t slot: used)
+			table[slot] = 0;
+		used.clear();
+	}
+	bool contains(uint64_t key) const {
+		const size_t mask(table.size()-1);
+		for (size_t slot=Hash(key)&mask; table[slot]; slot=(slot+1)&mask)
+			if (table[slot] == key)
+				return true;
+		return false;
+	}
+	void insert(uint64_t key) {
+		if (2*(used.size()+1) > table.size())
+			Grow();
+		const size_t mask(table.size()-1);
+		size_t slot(Hash(key)&mask);
+		for (; table[slot]; slot=(slot+1)&mask)
+			if (table[slot] == key)
+				return;
+		table[slot] = key;
+		used.push_back(slot);
+	}
+private:
+	static size_t Hash(uint64_t key) {
+		key ^= key >> 33;
+		key *= 0xff51afd7ed558ccdULL;
+		key ^= key >> 33;
+		return static_cast<size_t>(key);
+	}
+	void Grow() {
+		std::vector<uint64_t> keys;
+		keys.reserve(used.size());
+		for (size_t slot: used)
+			keys.push_back(table[slot]);
+		table.assign(table.size()*2, 0);
+		used.clear();
+		for (uint64_t key: keys)
+			insert(key);
+	}
+	std::vector<uint64_t> table;
+	std::vector<size_t> used;
+};
+
 class StreamingFusionCache
 {
 public:
@@ -1527,74 +1581,114 @@ public:
 		Entry& entry = entries[id];
 		if (entry.pinned)
 			return true;
-		size_t required = entry.maskBytes;
-		if (!entry.cached) {
-			if (entry.residentEstimate > std::numeric_limits<size_t>::max() - required ||
-				entry.decodeBytes > std::numeric_limits<size_t>::max() - required - entry.residentEstimate)
-			{
-				VERBOSE("error: streaming cache size overflow for image %u", id);
-				return false;
-			}
-			required += entry.residentEstimate + entry.decodeBytes;
-		}
-		if (!MakeRoom(required))
+		if (entry.cached)
+			return PinCached(id);
+
+		size_t required;
+		if (!RequiredBytes(id, required) || !MakeRoom(required, false))
 			return false;
-		if (!entry.cached) {
+		usedBytes += required;
+		const IIndex ids[] = {id};
+		return LoadReserved(ids, 1);
+	}
+
+	// pin several depth-maps, loading the missing ones in parallel;
+	// the reserved memory includes the decode buffers of all concurrent loads,
+	// so the batch shrinks automatically if the cache budget is tight
+	bool PinMany(const IIndexArr& ids) {
+		// pin first the cached depth-maps so that loading the others can not evict them
+		for (IIndex id: ids) {
+			const Entry& entry = entries[id];
+			if (!entry.pinned && entry.cached && !PinCached(id))
+				return false;
+		}
+		std::vector<IIndex> pending;
+		for (IIndex id: ids) {
+			Entry& entry = entries[id];
+			if (entry.pinned)
+				continue;
+			ASSERT(!entry.cached);
+
+			size_t required;
+			if (!RequiredBytes(id, required))
+				return false;
+			if (!MakeRoom(required, !pending.empty())) {
+				if (pending.empty())
+					return false;
+				if (!LoadReserved(pending.data(), pending.size()))
+					return false;
+				pending.clear();
+				if (!MakeRoom(required, false))
+					return false;
+			}
+			usedBytes += required;
+			pending.push_back(id);
+		}
+		return pending.empty() || LoadReserved(pending.data(), pending.size());
+	}
+	// reserve the cache memory for the depth-maps of the next round that are not cached yet,
+	// protecting the cached ones from eviction; stops at the first one that does not fit
+	IIndexArr ReservePrefetch(const IIndexArr& ids) {
+		IIndexArr reserved;
+		for (IIndex id: ids) {
+			Entry& entry = entries[id];
+			if (entry.pinned || entry.protect)
+				continue;
+			if (entry.cached) {
+				entry.protect = true;
+				protectedIDs.push_back(id);
+				continue;
+			}
+			size_t required;
+			if (!RequiredBytes(id, required) || !MakeRoom(required, true))
+				break;
+			usedBytes += required;
+			entry.protect = true;
+			protectedIDs.push_back(id);
+			reserved.push_back(id);
+		}
+		return reserved;
+	}
+
+	// load the given depth-maps and images; only touches the data of these images,
+	// so it can run concurrently with the fusion of other (pinned) depth-maps
+	std::vector<String> LoadParallel(const IIndex* ids, size_t count, int maxThreads) const {
+		std::vector<String> errors(count);
+		#ifdef DENSE_USE_OPENMP
+		const int numThreads(maxThreads > 0 ? maxThreads : omp_get_max_threads());
+		#pragma omp parallel for schedule(dynamic, 1) num_threads(numThreads) if (count > 1)
+		#endif
+		for (int64_t i=0; i<(int64_t)count; ++i) {
+			const IIndex id(ids[i]);
 			DepthData& data = depthData[id];
 			const String fileName(ComposeDepthFilePath(data.GetView().GetID(), "dmap"));
 			if (!data.Load(fileName, HeaderDepthDataRaw::HAS_DEPTH | HeaderDepthDataRaw::HAS_NORMAL | HeaderDepthDataRaw::HAS_CONF)) {
-				VERBOSE("error: cannot load depth-map '%s'", fileName.c_str());
-				data.Release();
-				return false;
+				errors[i] = String::FormatString("error: cannot load depth-map '%s'", fileName.c_str());
+				continue;
 			}
 			if (data.normalMap.empty() && !EstimateNormalMap(data.GetView().camera.K, data.depthMap, data.normalMap)) {
-				VERBOSE("error: cannot estimate normals for depth-map '%s'", fileName.c_str());
-				data.Release();
-				return false;
+				errors[i] = String::FormatString("error: cannot estimate normals for depth-map '%s'", fileName.c_str());
+				continue;
 			}
 			if (colors) {
 				Image& image = images[id];
 				const cv::Size expectedSize(image.GetSize());
-				if (!image.ReloadImage(MAXF(expectedSize.width, expectedSize.height)) || image.GetSize() != expectedSize || image.image.size() != expectedSize) {
-					VERBOSE("error: cannot load image '%s' at its depth-map resolution", image.name.c_str());
-					data.Release();
-					image.ReleaseImage();
-					return false;
-				}
+				if (!image.ReloadImage(MAXF(expectedSize.width, expectedSize.height)) || image.GetSize() != expectedSize || image.image.size() != expectedSize)
+					errors[i] = String::FormatString("error: cannot load image '%s' at its depth-map resolution", image.name.c_str());
 			}
-			entry.residentBytes = data.GetMemorySize() + (colors ? images[id].image.memory_size() : 0);
-			if (entry.residentBytes > entry.residentEstimate) {
-				VERBOSE("error: streaming cache estimate exceeded for image %u (%llu bytes used, %llu estimated)",
-					id, static_cast<unsigned long long>(entry.residentBytes), static_cast<unsigned long long>(entry.residentEstimate));
-				data.Release();
-				images[id].ReleaseImage();
-				return false;
-			}
-			usedBytes += entry.residentBytes;
-			lru.push_front(id);
-			entry.position = lru.begin();
-			entry.cached = true;
-			// Keep the fusion order independent of physical cache evictions.
-			entry.usedForScheduling = true;
-		} else {
-			lru.splice(lru.begin(), lru, entry.position);
-			entry.position = lru.begin();
 		}
-		BitMatrix& mask = masks[id];
-		mask.create(depthData[id].size);
-		if (entry.initialized) {
-			if (!scratch.setPos(entry.maskOffset) || scratch.read(mask.data, entry.maskBytes) != entry.maskBytes) {
-				VERBOSE("error: cannot read streaming fusion mask for image %u", id);
-				mask.release();
-				return false;
-			}
-		} else {
-			mask.memset(0);
-			entry.initialized = true;
-		}
-		usedBytes += entry.maskBytes;
-		entry.pinned = true;
-		return true;
+		#ifndef DENSE_USE_OPENMP
+		(void)maxThreads;
+		#endif
+		return errors;
+	}
+
+	// register the prefetched depth-maps (unpinned) and drop the eviction protection
+	bool FinishPrefetch(const IIndexArr& ids, std::vector<String>& errors) {
+		for (IIndex id: protectedIDs)
+			entries[id].protect = false;
+		protectedIDs.clear();
+		return ids.empty() || FinishLoad(ids.data(), ids.size(), errors, false);
 	}
 
 	bool FinishRound() {
@@ -1626,6 +1720,7 @@ private:
 	struct Entry {
 		bool cached = false;
 		bool pinned = false;
+		bool protect = false;
 		bool initialized = false;
 		bool usedForScheduling = false;
 		size_t maskBytes = 0;
@@ -1636,17 +1731,31 @@ private:
 		std::list<IIndex>::iterator position;
 	};
 
-	bool MakeRoom(size_t required) {
+	bool RequiredBytes(IIndex id, size_t& required) const {
+		const Entry& entry = entries[id];
+		required = entry.maskBytes;
+		if (entry.residentEstimate > std::numeric_limits<size_t>::max() - required ||
+			entry.decodeBytes > std::numeric_limits<size_t>::max() - required - entry.residentEstimate)
+		{
+			VERBOSE("error: streaming cache size overflow for image %u", id);
+			return false;
+		}
+		required += entry.residentEstimate + entry.decodeBytes;
+		return true;
+	}
+
+	bool MakeRoom(size_t required, bool quiet) {
 		while (required > maxBytes || usedBytes > maxBytes - required) {
 			auto it = lru.end();
 			while (it != lru.begin()) {
 				--it;
-				if (!entries[*it].pinned)
+				if (!entries[*it].pinned && !entries[*it].protect)
 					break;
 			}
-			if (it == lru.end() || entries[*it].pinned) {
-				VERBOSE("error: active depth-maps, images and masks need more than the %llu MiB streaming cache; increase --stream-fusion-cache-mb",
-					static_cast<unsigned long long>(maxBytes / (1024*1024)));
+			if (it == lru.end() || entries[*it].pinned || entries[*it].protect) {
+				if (!quiet)
+					VERBOSE("error: active depth-maps, images and masks need more than the %llu MiB streaming cache; increase --stream-fusion-cache-mb",
+						static_cast<unsigned long long>(maxBytes / (1024*1024)));
 				return false;
 			}
 			const IIndex id(*it);
@@ -1660,6 +1769,78 @@ private:
 		return true;
 	}
 
+	bool PinCached(IIndex id) {
+		Entry& entry = entries[id];
+		ASSERT(entry.cached && !entry.pinned);
+		lru.splice(lru.begin(), lru, entry.position);
+		entry.position = lru.begin();
+		// protect the entry from being evicted while making room for its mask
+		entry.pinned = true;
+		const bool ok(MakeRoom(entry.maskBytes, false));
+		entry.pinned = false;
+		return ok && PinMask(id);
+	}
+
+	// load the depth-maps (and images) whose memory was already reserved
+	bool LoadReserved(const IIndex* ids, size_t count) {
+		std::vector<String> errors(LoadParallel(ids, count, 0));
+		return FinishLoad(ids, count, errors, true);
+	}
+
+	// register the loaded depth-maps in the cache, releasing the unused part of their reservation
+	bool FinishLoad(const IIndex* ids, size_t count, std::vector<String>& errors, bool pin) {
+		bool ok(true);
+		for (size_t i=0; i<count; ++i) {
+			const IIndex id(ids[i]);
+			Entry& entry = entries[id];
+			DepthData& data = depthData[id];
+			size_t required;
+			RequiredBytes(id, required);
+			usedBytes -= required;
+			if (ok && errors[i].empty()) {
+				entry.residentBytes = data.GetMemorySize() + (colors ? images[id].image.memory_size() : 0);
+				if (entry.residentBytes > entry.residentEstimate)
+					errors[i] = String::FormatString("error: streaming cache estimate exceeded for image %u (%llu bytes used, %llu estimated)",
+						id, static_cast<unsigned long long>(entry.residentBytes), static_cast<unsigned long long>(entry.residentEstimate));
+			}
+			if (!ok || !errors[i].empty()) {
+				if (ok)
+					VERBOSE("%s", errors[i].c_str());
+				ok = false;
+				data.Release();
+				images[id].ReleaseImage();
+				continue;
+			}
+			usedBytes += entry.residentBytes;
+			lru.push_front(id);
+			entry.position = lru.begin();
+			entry.cached = true;
+			// Keep the fusion order independent of physical cache evictions.
+			entry.usedForScheduling = true;
+			// the mask memory was part of the reservation
+			if (pin && !PinMask(id))
+				ok = false;
+		}
+		return ok;
+	}
+	bool PinMask(IIndex id) {
+		Entry& entry = entries[id];
+		BitMatrix& mask = masks[id];
+		mask.create(depthData[id].size);
+		if (entry.initialized) {
+			if (!scratch.setPos(entry.maskOffset) || scratch.read(mask.data, entry.maskBytes) != entry.maskBytes) {
+				VERBOSE("error: cannot read streaming fusion mask for image %u", id);
+				mask.release();
+				return false;
+			}
+		} else {
+			mask.memset(0);
+			entry.initialized = true;
+		}
+		usedBytes += entry.maskBytes;
+		entry.pinned = true;
+		return true;
+	}
 	DepthDataArr& depthData;
 	ImageArr& images;
 	cList<BitMatrix,const BitMatrix&,1,16,IIndex>& masks;
@@ -1669,6 +1850,7 @@ private:
 	bool colors;
 	std::vector<Entry> entries;
 	std::list<IIndex> lru;
+	IIndexArr protectedIDs;
 	File scratch;
 };
 
@@ -1990,14 +2172,47 @@ bool DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 	unsigned totalNumImageNeighborsInCache = 0, totalNumImagesInCache = 0;
 	size_t numFusedPoints(0);
 	BoolArr neighbors(arrDepthData.size());
-	PointCloud::Point refPoint;
-	PointCloud::Normal refNormal;
-	CLISTDEF0IDX(float, unsigned) fusedPoints[3];
-	PointCloud::ViewArr fusedViews;
-	FloatArr fusedWeights;
-	Point3d fusedNormal(Point3d::ZERO);
-	Pixel32F fusedColor(Pixel32F::BLACK);
-	const auto FusePoint = [&](IIndex ID, const ImageRef& x, unsigned fuseDepth) -> void {
+	typedef std::pair<IIndex,ImageRef> FuseClaim;
+	struct alignas(64) FuseState {
+		PointCloud::Point refPoint;
+		PointCloud::Normal refNormal;
+		CLISTDEF0IDX(float, unsigned) fusedPoints[3];
+		PointCloud::ViewArr fusedViews;
+		FloatArr fusedWeights;
+		Point3d fusedNormal = Point3d::ZERO;
+		Pixel32F fusedColor = Pixel32F::BLACK;
+		// speculative fusion only records the pixels it would mark as used,
+		// leaving the shared masks untouched so several threads can run concurrently;
+		// the pixels claimed by the previous points of the same strip are kept in "taken"
+		// and any pixel skipped because of them is recorded so the commit can validate it
+		bool speculative = false;
+		double speculationTime = 0;
+		std::vector<FuseClaim> claims;
+		std::vector<FuseClaim> skipped;
+		FlatKeySet taken;
+		static uint64_t Key(IIndex ID, const ImageRef& x) {
+			return ((uint64_t(ID)+1)<<32) | (uint64_t(uint16_t(x.y))<<16) | uint64_t(uint16_t(x.x));
+		}
+		void Reset() {
+			fusedPoints[0].clear();
+			fusedPoints[1].clear();
+			fusedPoints[2].clear();
+			fusedViews.clear();
+			fusedWeights.clear();
+			fusedNormal = Point3d::ZERO;
+			fusedColor = Pixel32F::BLACK;
+			claims.clear();
+			skipped.clear();
+		}
+	};
+	const auto FusePoint = [&](FuseState& s, IIndex ID, const ImageRef& x, unsigned fuseDepth) -> void {
+		PointCloud::Point& refPoint = s.refPoint;
+		PointCloud::Normal& refNormal = s.refNormal;
+		auto& fusedPoints = s.fusedPoints;
+		PointCloud::ViewArr& fusedViews = s.fusedViews;
+		FloatArr& fusedWeights = s.fusedWeights;
+		Point3d& fusedNormal = s.fusedNormal;
+		Pixel32F& fusedColor = s.fusedColor;
 		const auto lambda = [&](IIndex ID, const ImageRef& x, unsigned fuseDepth, const auto& FusePointImpl) -> void {
 			const DepthData& depthData = arrDepthData[ID];
 			if (!Image8U::isInside(x, depthData.size))
@@ -2012,6 +2227,10 @@ bool DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 			UseMask& useMask = arrUseMask[ID];
 			if (useMask(x))
 				return;
+			if (s.speculative && s.taken.contains(FuseState::Key(ID, x))) {
+				s.skipped.emplace_back(ID, x);
+				return;
+			}
 			// ignore pixel if not confident
 			const float conf(depthData.confMap.empty() ? 1.f : depthData.confMap(x));
 			if (conf < minConfidence)
@@ -2041,7 +2260,12 @@ bool DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 				ASSERT(ISEQUAL(norm(normal), 1.f, 1e-2f), "Norm = ", norm(normal));
 			}
 			// set the current pixel as visited
-			useMask.set(x);
+			if (s.speculative) {
+				s.claims.emplace_back(ID, x);
+				s.taken.insert(FuseState::Key(ID, x));
+			} else {
+				useMask.set(x);
+			}
 			// compute 3D location of the current depth
 			const PointCloud::Point X(image.camera.TransformPointI2W(Point3(REAL(x.x), REAL(x.y), REAL(depth))));
 			// accumulate statistics for fused point
@@ -2085,23 +2309,363 @@ bool DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 		};
 		lambda(ID, x, fuseDepth, lambda);
 	};
+	// streaming fusion: each depth-map is split in row strips fused speculatively in parallel
+	// against the masks as they were at the start of the batch; the results are then committed
+	// in the original pixel order, recomputing any point whose speculation became invalid,
+	// so the output is identical to the sequential fusion
+	struct StreamPoint {
+		PointCloud::Point point;
+		PointCloud::Normal normal;
+		PointCloud::Color color;
+		double gsd = 0;
+		uint32_t numViews = 0;
+		uint32_t x = 0, y = 0;
+		uint32_t claimsBegin = 0, claimsEnd = 0;
+		uint32_t skippedBegin = 0, skippedEnd = 0;
+		bool fused = false;
+		bool write = false;
+	};
+	const auto MakeStreamPoint = [&](FuseState& s, StreamPoint& p) {
+		p.numViews = static_cast<uint32_t>(s.fusedViews.size());
+		p.fused = !s.fusedViews.empty() && s.fusedPoints[0].size() >= OPTDENSE::nMinPixelsFuse && s.fusedViews.size() >= nMinViewsFuse;
+		if (!p.fused)
+			return;
+		p.point = PointCloud::Point(
+			s.fusedPoints[0].GetMedian(),
+			s.fusedPoints[1].GetMedian(),
+			s.fusedPoints[2].GetMedian()
+		);
+		p.write = !cropROI || cropROI->Intersects(p.point);
+		if (!p.write)
+			return;
+		p.normal = PointCloud::Normal(0, 0, 0);
+		p.color = PointCloud::Color(0, 0, 0);
+		if (_bEstimateNormal || simplifier)
+			p.normal = normalized(s.fusedNormal);
+		if (bEstimateColor)
+			p.color = (s.fusedColor/static_cast<float>(s.fusedPoints[0].size())).cast<uint8_t>();
+		if (simplifier) {
+			std::vector<double> scales;
+			for (IIndex view : s.fusedViews) {
+				const double gsd = SurfacePixelSize(arrDepthData[view].GetView().camera,Point3d(p.point),Point3d(p.normal));
+				if (gsd > 0)
+					scales.push_back(gsd);
+			}
+			std::sort(scales.begin(),scales.end());
+			p.gsd = scales.empty() ? 0 : scales[size_t(0.2*double(scales.size()-1))];
+		}
+	};
+	// the fused points are written in order by a background thread, overlapping the fusion
+	struct StreamOutput {
+		PointCloud::Point point;
+		PointCloud::Normal normal;
+		PointCloud::Color color;
+		uint32_t numViews;
+		double gsd;
+	};
+	const size_t outputBatchSize(1u<<16);
+	std::vector<StreamOutput> outputBuffer, writeBuffer;
+	std::future<bool> outputWriter;
+	const auto WaitOutput = [&]() -> bool {
+		return !outputWriter.valid() || outputWriter.get();
+	};
+	const auto FlushOutput = [&]() -> bool {
+		if (!WaitOutput())
+			return false;
+		if (outputBuffer.empty())
+			return true;
+		writeBuffer.swap(outputBuffer);
+		outputBuffer.clear();
+		outputWriter = std::async(std::launch::async, [&]() -> bool {
+			for (const StreamOutput& o: writeBuffer) {
+				if (simplifier ?
+					!simplifier->Write(o.point,o.color,o.normal,o.numViews,o.gsd) :
+					!stream->Write(o.point,o.color,o.normal,o.numViews))
+					return false;
+			}
+			return true;
+		});
+		return true;
+	};
+	const auto CommitStreamPoint = [&](const StreamPoint& p) -> bool {
+		nDepths += p.numViews;
+		if (!p.fused)
+			return true;
+		++numFusedPoints;
+		if (!p.write)
+			return true;
+		outputBuffer.push_back(StreamOutput{p.point,p.normal,p.color,p.numViews,p.gsd});
+		return outputBuffer.size() < outputBatchSize || FlushOutput();
+	};
+	#ifdef DENSE_USE_OPENMP
+	const int numFuseThreads(stream ? MAXF(1, omp_get_max_threads()) : 1);
+	#else
+	const int numFuseThreads(1);
+	#endif
+	std::vector<FuseState> fuseStates(numFuseThreads);
+	for (FuseState& s: fuseStates)
+		s.speculative = true;
+	FuseState commitState;
+	// each task fuses a strip of consecutive rows in order
+	const int fuseStripRows(32), fuseWarmupRows(4);
+	struct alignas(64) StreamStrip {
+		std::vector<StreamPoint> points;
+		std::vector<FuseClaim> claims;
+		std::vector<FuseClaim> skipped;
+	};
+	std::vector<StreamStrip> stripSlots(numFuseThreads > 1 ? 2*numFuseThreads : 0);
+	std::vector<std::atomic<int>> stripReady(stripSlots.size());
+	// the speculative pixel keys pack the coordinates in 16 bits
+	bool smallDepthMaps(true);
+	for (const DepthData& depthData: arrDepthData)
+		if (depthData.size.width > 0xFFFF || depthData.size.height > 0xFFFF)
+			smallDepthMaps = false;
+	size_t numSpeculativePoints(0), numRecomputedPoints(0);
+	typedef std::chrono::steady_clock FuseClock;
+	const auto Elapsed = [](FuseClock::time_point& t) -> double {
+		const FuseClock::time_point now(FuseClock::now());
+		const double s(std::chrono::duration<double>(now-t).count());
+		t = now;
+		return s;
+	};
+	double timeSelect(0), timeLoad(0), timeFuse(0), timeCommit(0), timeRecompute(0), timeRound(0);
+	const auto CommitSequential = [&](IIndex idxImage, const ImageRef& x) -> bool {
+		FusePoint(commitState, idxImage, x, 0);
+		if (commitState.fusedViews.empty())
+			return true;
+		StreamPoint p;
+		MakeStreamPoint(commitState, p);
+		commitState.Reset();
+		return CommitStreamPoint(p);
+	};
+	// a speculative point is valid if all its claimed pixels are still free
+	// and all pixels it skipped as taken by earlier points of its strip are really taken
+	const auto IsSpeculationValid = [&](const StreamStrip& strip, const StreamPoint& p) -> bool {
+		for (uint32_t k=p.claimsBegin; k<p.claimsEnd; ++k)
+			if (arrUseMask[strip.claims[k].first](strip.claims[k].second))
+				return false;
+		for (uint32_t k=p.skippedBegin; k<p.skippedEnd; ++k) {
+			const FuseClaim& skip = strip.skipped[k];
+			if (arrUseMask[skip.first](skip.second))
+				continue;
+			bool own(false);
+			for (uint32_t c=p.claimsBegin; c<p.claimsEnd; ++c) {
+				if (strip.claims[c] == skip) {
+					own = true;
+					break;
+				}
+			}
+			if (!own)
+				return false;
+		}
+		return true;
+	};
+	const auto FuseStreamDepthMap = [&](IIndex idxImage) -> bool {
+		const cv::Size size(arrDepthData[idxImage].size);
+		if (numFuseThreads <= 1 || !smallDepthMaps) {
+			for (int i=0; i<size.height; ++i)
+				for (int j=0; j<size.width; ++j)
+					if (!CommitSequential(idxImage, ImageRef(j,i)))
+						return false;
+			return true;
+		}
+		// the strips are fused speculatively in parallel into a ring of buffers and committed in order
+		// by whichever thread holds the commit lock, so no thread waits for the commit of a strip;
+		// the speculation may observe the masks while they are being committed, which is harmless
+		// because the masks only ever get set and every speculative point is validated at commit
+		FuseClock::time_point t(FuseClock::now());
+		const int numStrips((size.height + fuseStripRows - 1) / fuseStripRows);
+		const int numSlots(static_cast<int>(stripSlots.size()));
+		std::atomic<int> nextStrip(0), nextCommit(0);
+		std::atomic<bool> fuseFailed(false);
+		std::mutex commitMutex;
+		for (std::atomic<int>& ready: stripReady)
+			ready.store(-1);
+		const auto SpeculateStrip = [&](FuseState& s, StreamStrip& buffer, int strip) {
+			buffer.points.clear();
+			buffer.claims.clear();
+			buffer.skipped.clear();
+			s.taken.clear();
+			const int i0(strip*fuseStripRows), i1(MINF(i0+fuseStripRows, size.height));
+			// warm up the claimed pixels with the last rows of the previous strip,
+			// which most of the time match what that strip will commit,
+			// avoiding most of the recomputations along the strip borders
+			for (int i=MAXF(0, i0-fuseWarmupRows); i<i0; ++i) {
+				for (int j=0; j<size.width; ++j) {
+					FusePoint(s, idxImage, ImageRef(j,i), 0);
+					s.Reset();
+				}
+			}
+			for (int i=i0; i<i1; ++i) {
+				for (int j=0; j<size.width; ++j) {
+					FusePoint(s, idxImage, ImageRef(j,i), 0);
+					if (s.fusedViews.empty() && s.skipped.empty())
+						continue;
+					buffer.points.emplace_back();
+					StreamPoint& p = buffer.points.back();
+					p.x = static_cast<uint32_t>(j);
+					p.y = static_cast<uint32_t>(i);
+					p.claimsBegin = static_cast<uint32_t>(buffer.claims.size());
+					buffer.claims.insert(buffer.claims.end(), s.claims.begin(), s.claims.end());
+					p.claimsEnd = static_cast<uint32_t>(buffer.claims.size());
+					p.skippedBegin = static_cast<uint32_t>(buffer.skipped.size());
+					buffer.skipped.insert(buffer.skipped.end(), s.skipped.begin(), s.skipped.end());
+					p.skippedEnd = static_cast<uint32_t>(buffer.skipped.size());
+					MakeStreamPoint(s, p);
+					s.Reset();
+				}
+			}
+		};
+		const auto CommitStrip = [&](const StreamStrip& buffer) -> bool {
+			const FuseClock::time_point tc(FuseClock::now());
+			bool ok(true);
+			for (const StreamPoint& p: buffer.points) {
+				++numSpeculativePoints;
+				if (!IsSpeculationValid(buffer, p)) {
+					++numRecomputedPoints;
+					const FuseClock::time_point tr(FuseClock::now());
+					const bool recomputed(CommitSequential(idxImage, ImageRef(static_cast<int>(p.x), static_cast<int>(p.y))));
+					timeRecompute += std::chrono::duration<double>(FuseClock::now()-tr).count();
+					if (!recomputed) {
+						ok = false;
+						break;
+					}
+					continue;
+				}
+				for (uint32_t k=p.claimsBegin; k<p.claimsEnd; ++k)
+					arrUseMask[buffer.claims[k].first].set(buffer.claims[k].second);
+				if (!CommitStreamPoint(p)) {
+					ok = false;
+					break;
+				}
+			}
+			timeCommit += std::chrono::duration<double>(FuseClock::now()-tc).count();
+			return ok;
+		};
+		// commit all the strips ready in order; returns false if another thread is committing
+		const auto TryCommit = [&]() {
+			std::unique_lock<std::mutex> lock(commitMutex, std::try_to_lock);
+			if (!lock.owns_lock())
+				return;
+			int strip(nextCommit.load(std::memory_order_relaxed));
+			while (strip < numStrips && !fuseFailed.load(std::memory_order_relaxed) &&
+				stripReady[strip%numSlots].load(std::memory_order_acquire) == strip)
+			{
+				if (!CommitStrip(stripSlots[strip%numSlots]))
+					fuseFailed = true;
+				nextCommit.store(++strip, std::memory_order_release);
+			}
+		};
+		#ifdef DENSE_USE_OPENMP
+		#pragma omp parallel num_threads(numFuseThreads)
+		#endif
+		{
+			#ifdef DENSE_USE_OPENMP
+			FuseState& s = fuseStates[omp_get_thread_num()];
+			#else
+			FuseState& s = fuseStates.front();
+			#endif
+			while (!fuseFailed.load(std::memory_order_relaxed)) {
+				TryCommit();
+				const int strip(nextStrip.fetch_add(1));
+				if (strip >= numStrips)
+					break;
+				// wait for the buffer slot to be released by the commit of the strip using it before
+				while (nextCommit.load(std::memory_order_acquire) <= strip-numSlots && !fuseFailed.load(std::memory_order_relaxed)) {
+					TryCommit();
+					std::this_thread::yield();
+				}
+				if (fuseFailed.load(std::memory_order_relaxed))
+					break;
+				const FuseClock::time_point ts(FuseClock::now());
+				SpeculateStrip(s, stripSlots[strip%numSlots], strip);
+				s.speculationTime += std::chrono::duration<double>(FuseClock::now()-ts).count();
+				stripReady[strip%numSlots].store(strip, std::memory_order_release);
+			}
+			// help committing the remaining strips
+			while (nextCommit.load(std::memory_order_acquire) < numStrips && !fuseFailed.load(std::memory_order_relaxed)) {
+				TryCommit();
+				std::this_thread::yield();
+			}
+		}
+		timeFuse += Elapsed(t);
+		return !fuseFailed;	};
 	// loop over each depth-map
 	IIndex numDMapsFused = 0;
+	FuseClock::time_point loopTime(FuseClock::now());
+	// streaming: the next depth-map and its neighbors are selected in advance (the selection
+	// does not depend on the fusion itself), so their missing data is loaded while fusing
+	struct FuseSelection {
+		bool valid = false;
+		IIndex idxImage = NO_ID;
+		unsigned numNeighborsInCache = 0, numImagesInCache = 0;
+		IIndexArr pinIDs;
+	};
+	const auto SelectStreamDMap = [&]() {
+		FuseSelection sel;
+		sel.valid = true;
+		std::tie(sel.idxImage, sel.numNeighborsInCache, sel.numImagesInCache) = FetchBestNextDMapIndex(arrDepthData, *streamCache, fusedDMaps);
+		if (sel.idxImage == NO_ID)
+			return sel;
+		sel.pinIDs.push_back(sel.idxImage);
+		IIndex numPinNeighbors(0);
+		for (const ViewScore& neighbor: arrDepthData[sel.idxImage].neighbors) {
+			if (!arrDepthData[neighbor.ID].IsValid())
+				continue;
+			sel.pinIDs.push_back(neighbor.ID);
+			if (!streamCache->HasMask(neighbor.ID) && ++numPinNeighbors >= OPTDENSE::nMaxViewsFuse)
+				break;
+		}
+		return sel;
+	};
+	FuseSelection nextSelection;
+	#ifdef DENSE_USE_OPENMP
+	const int prefetchThreads(MAXF(2, numFuseThreads/4));
+	#else
+	const int prefetchThreads(1);
+	#endif
 	while (true) {
 		TD_TIMER_STARTD();
+		Elapsed(loopTime);
 		// find the best depth-map to fuse next as the one with the most neighbors already in cache
-		const auto [idxImage, numImageNeighborsInCache, numImagesInCache] = stream
-			? FetchBestNextDMapIndex(arrDepthData, *streamCache, fusedDMaps)
-			: FetchBestNextDMapIndex(arrDepthData, cacheDMaps, fusedDMaps);
+		IIndex idxImage;
+		unsigned numImageNeighborsInCache, numImagesInCache;
+		IIndexArr pinIDs;
+		if (stream) {
+			FuseSelection sel(nextSelection.valid ? std::move(nextSelection) : SelectStreamDMap());
+			nextSelection = FuseSelection();
+			idxImage = sel.idxImage;
+			numImageNeighborsInCache = sel.numNeighborsInCache;
+			numImagesInCache = sel.numImagesInCache;
+			pinIDs = std::move(sel.pinIDs);
+		} else {
+			std::tie(idxImage, numImageNeighborsInCache, numImagesInCache) = FetchBestNextDMapIndex(arrDepthData, cacheDMaps, fusedDMaps);
+		}
 		if (idxImage == NO_ID)
 			break; // no more depth-maps to fuse (only invalid depth-maps left)
 		totalNumImageNeighborsInCache += numImageNeighborsInCache;
 		totalNumImagesInCache += numImagesInCache;
 		++numDMapsFused;
 		// fuse depth-map
+		IIndexArr prefetchIDs;
+		std::future<std::vector<String>> prefetch;
 		if (stream) {
-			if (!streamCache->Pin(idxImage))
+			// load the missing reference and neighbor depth-maps in parallel
+			timeSelect += Elapsed(loopTime);
+			if (!streamCache->PinMany(pinIDs))
 				return fail();
+			timeLoad += Elapsed(loopTime);
+			// select the next depth-map and start loading its missing data
+			fusedDMaps[idxImage] = true;
+			nextSelection = SelectStreamDMap();
+			if (nextSelection.idxImage != NO_ID) {
+				prefetchIDs = streamCache->ReservePrefetch(nextSelection.pinIDs);
+				if (!prefetchIDs.empty())
+					prefetch = std::async(std::launch::async, [&streamCache, &prefetchIDs, prefetchThreads]() {
+						return streamCache->LoadParallel(prefetchIDs.data(), prefetchIDs.size(), prefetchThreads);
+					});
+			}
+			timeSelect += Elapsed(loopTime);
 		} else {
 			cacheDMaps.UseImage(idxImage);
 			cacheDMaps.SkipMemoryCheckIdxImage(idxImage);
@@ -2117,16 +2681,8 @@ bool DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 		IIndex numNeighbors(0);
 		ASSERT(!depthData.images.empty() && !depthData.neighbors.empty());
 		if (stream) {
-			for (const ViewScore& neighbor: depthData.neighbors) {
-				if (!arrDepthData[neighbor.ID].IsValid())
-					continue;
-				const bool hadMask(streamCache->HasMask(neighbor.ID));
-				if (!streamCache->Pin(neighbor.ID))
-					return fail();
-				neighbors[neighbor.ID] = true;
-				if (!hadMask && ++numNeighbors >= OPTDENSE::nMaxViewsFuse)
-					break;
-			}
+			for (IIndex i=1; i<pinIDs.size(); ++i)
+				neighbors[pinIDs[i]] = true;
 		} else {
 		#ifdef DENSE_USE_OPENMP
 		bool bAbort(false);
@@ -2172,62 +2728,36 @@ bool DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 		}
 		// try to fuse each depth estimate
 		const size_t nNumPointsPrev(stream ? numFusedPoints : pointcloud.points.size());
-		for (int i=0; i<depthData.size.height; ++i) {
-			for (int j=0; j<depthData.size.width; ++j) {
-				FusePoint(idxImage, ImageRef(j,i), 0);
-				if (fusedPoints[0].size() >= OPTDENSE::nMinPixelsFuse && fusedViews.size() >= nMinViewsFuse) {
-					// create the corresponding 3D point
-					const PointCloud::Point point(
-						fusedPoints[0].GetMedian(),
-						fusedPoints[1].GetMedian(),
-						fusedPoints[2].GetMedian()
-					);
-					++numFusedPoints;
-					if (stream) {
-						if (!cropROI || cropROI->Intersects(point)) {
-							PointCloud::Normal normal(0, 0, 0);
-							PointCloud::Color color(0, 0, 0);
-							if (_bEstimateNormal || simplifier)
-								normal = normalized(fusedNormal);
-							if (bEstimateColor)
-								color = (fusedColor/static_cast<float>(fusedPoints[0].size())).cast<uint8_t>();
-							if (simplifier) {
-								std::vector<double> scales;
-								for (IIndex view : fusedViews) {
-									const double gsd = SurfacePixelSize(arrDepthData[view].GetView().camera,Point3d(point),Point3d(normal));
-									if (gsd > 0)
-										scales.push_back(gsd);
-								}
-								std::sort(scales.begin(),scales.end());
-								const double gsd = scales.empty() ? 0 : scales[size_t(0.2*double(scales.size()-1))];
-								if (!simplifier->Write(point,color,normal,fusedViews.size(),gsd))
-									return fail();
-							} else if (!stream->Write(point, color, normal, fusedViews.size())) {
-								return fail();
-							}
-						}
-					} else {
-						pointcloud.points.emplace_back(point);
-						ASSERT(fusedViews.size() == fusedWeights.size());
+		if (stream) {
+			if (!FuseStreamDepthMap(idxImage))
+				return fail();
+		} else {
+			FuseState& s = commitState;
+			for (int i=0; i<depthData.size.height; ++i) {
+				for (int j=0; j<depthData.size.width; ++j) {
+					FusePoint(s, idxImage, ImageRef(j,i), 0);
+					if (s.fusedPoints[0].size() >= OPTDENSE::nMinPixelsFuse && s.fusedViews.size() >= nMinViewsFuse) {
+						// create the corresponding 3D point
+						pointcloud.points.emplace_back(
+							s.fusedPoints[0].GetMedian(),
+							s.fusedPoints[1].GetMedian(),
+							s.fusedPoints[2].GetMedian()
+						);
+						++numFusedPoints;
+						ASSERT(s.fusedViews.size() == s.fusedWeights.size());
 						PointCloud::WeightArr& weights = pointcloud.pointWeights.AddEmpty();
-						for (float weight: fusedWeights)
+						for (float weight: s.fusedWeights)
 							weights.push_back(weight);
-						pointcloud.pointViews.emplace_back(fusedViews);
+						pointcloud.pointViews.emplace_back(s.fusedViews);
 						if (bEstimateNormal)
-							pointcloud.normals.emplace_back(normalized(fusedNormal));
+							pointcloud.normals.emplace_back(normalized(s.fusedNormal));
 						if (bEstimateColor)
-							pointcloud.colors.emplace_back((fusedColor/static_cast<float>(fusedPoints[0].size())).cast<uint8_t>());
+							pointcloud.colors.emplace_back((s.fusedColor/static_cast<float>(s.fusedPoints[0].size())).cast<uint8_t>());
 					}
-				}
-				if (!fusedViews.empty()) {
-					nDepths += fusedViews.size();
-					fusedPoints[0].clear();
-					fusedPoints[1].clear();
-					fusedPoints[2].clear();
-					fusedViews.clear();
-					fusedWeights.clear();
-					fusedNormal = Point3d::ZERO;
-					fusedColor = Pixel32F::BLACK;
+					if (!s.fusedViews.empty()) {
+						nDepths += s.fusedViews.size();
+						s.Reset();
+					}
 				}
 			}
 		}
@@ -2240,16 +2770,33 @@ bool DepthMapsData::DenseFuseDepthMaps(PointCloud& pointcloud, bool bEstimateCol
 		progress.display(numDMapsFused);
 		// ensure enough memory is available for the next depth-maps chunk
 		if (stream) {
+			Elapsed(loopTime);
 			if (!streamCache->FinishRound())
 				return fail();
+			std::vector<String> prefetchErrors;
+			if (prefetch.valid())
+				prefetchErrors = prefetch.get();
+			if (!streamCache->FinishPrefetch(prefetchIDs, prefetchErrors))
+				return fail();
+			timeRound += Elapsed(loopTime);
 		} else {
 			cacheDMaps.SkipMemoryCheckIdxImage();
 			if (numDMapsFused % numDMapsReserveFusion == 0)
 				cacheDMaps.SetMaxMemory(GetAvailableMemory(arrDepthData, fusedDMaps, numDMapsReserveFusion, cacheDMaps.GetUsedMemory()));
 		}
 	}
+	if (stream && (!FlushOutput() || !WaitOutput()))
+		return fail();
 	if (stream && !streamCache->Finish())
 		return fail();
+	if (stream) {
+		double timeSpeculation(0);
+		for (const FuseState& s: fuseStates)
+			timeSpeculation += s.speculationTime;
+		VERBOSE("Streaming fusion: %d threads, %llu speculative points, %llu recomputed; time select %.1fs, load %.1fs, fuse %.1fs (speculation %.1fs cpu), commit %.1fs (recompute %.1fs), masks %.1fs",
+			numFuseThreads, static_cast<unsigned long long>(numSpeculativePoints), static_cast<unsigned long long>(numRecomputedPoints),
+			timeSelect, timeLoad, timeFuse, timeSpeculation, timeCommit, timeRecompute, timeRound);
+	}
 	GET_LOGCONSOLE().Play();
 	progress.close();
 	streamCache.reset();
